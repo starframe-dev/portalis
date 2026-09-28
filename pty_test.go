@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -208,4 +209,30 @@ func TestSendBytesReturnsWriteError(t *testing.T) {
 	if !ok || got.Err == nil {
 		t.Fatalf("SendBytes message = %#v, want PtyErrorMsg", msg)
 	}
+}
+
+func TestSpawnEndToEndPreservesFinalOutput(t *testing.T) {
+	p, err := Spawn("/bin/sh", []string{"-c", "printf 'hello\\033[31mred\\033[0m'"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	screen := NewScreen(2, 30)
+	parser := NewParser(screen)
+	for i := 0; i < 32; i++ {
+		msg := p.Listen("session")()
+		switch msg := msg.(type) {
+		case PtyOutputMsg:
+			parser.Feed(msg.Data)
+		case PtyExitMsg:
+			if got := screen.LineText(0); !strings.Contains(got, "hellored") {
+				t.Fatalf("final PTY output = %q, want hellored", got)
+			}
+			return
+		default:
+			t.Fatalf("unexpected PTY message %T", msg)
+		}
+	}
+	t.Fatal("PTY did not terminate within message bound")
 }
