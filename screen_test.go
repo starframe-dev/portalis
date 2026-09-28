@@ -1082,3 +1082,82 @@ func TestParserSpinnerWithWideChars(t *testing.T) {
 		t.Fatalf("cursor row = %d, want 5", s.Cursor.Row)
 	}
 }
+
+
+func TestAltScreenResizePreservesPrimaryDimensions(t *testing.T) {
+	s := NewScreen(3, 5)
+	for _, r := range "hello" {
+		s.Put(r)
+	}
+	s.EnterAltScreen()
+	s.Resize(6, 10)
+	s.Put('X')
+	s.ExitAltScreen()
+
+	if s.Rows != 6 || s.Cols != 10 {
+		t.Fatalf("screen dimensions = %dx%d, want 6x10", s.Rows, s.Cols)
+	}
+	if len(s.Cells) != 6 || len(s.Cells[0]) != 10 {
+		t.Fatalf("restored grid dimensions = %dx%d, want 6x10", len(s.Cells), len(s.Cells[0]))
+	}
+	if got := s.RenderLine(0); !strings.HasPrefix(got, "hello") {
+		t.Fatalf("primary screen content lost after alt resize: %q", got)
+	}
+}
+
+func TestAltScreenDoesNotPolluteScrollback(t *testing.T) {
+	s := NewScreen(2, 4)
+	s.EnterAltScreen()
+	for i := 0; i < 20; i++ {
+		s.Put('A')
+	}
+	if got := len(s.scrollback); got != 0 {
+		t.Fatalf("alt screen added %d scrollback lines", got)
+	}
+	s.ExitAltScreen()
+	if got := len(s.scrollback); got != 0 {
+		t.Fatalf("scrollback changed after leaving alt screen: %d", got)
+	}
+}
+
+func TestGraphemeCombiningDataIsBounded(t *testing.T) {
+	s := NewScreen(1, 10)
+	s.Put('a')
+	for i := 0; i < maxGraphemeBytes*4; i++ {
+		s.Put('́')
+	}
+	if got := len(s.Cells[0][0].Combining); got > maxGraphemeBytes {
+		t.Fatalf("combining data grew to %d bytes, limit %d", got, maxGraphemeBytes)
+	}
+	if s.Cursor.Col != 1 {
+		t.Fatalf("combining flood moved cursor to %d", s.Cursor.Col)
+	}
+}
+
+func TestScreenDimensionsAreClamped(t *testing.T) {
+	s := NewScreen(0, -5)
+	if s.Rows != 1 || s.Cols != 1 {
+		t.Fatalf("NewScreen clamped to %dx%d, want 1x1", s.Rows, s.Cols)
+	}
+	s.Resize(0, 0)
+	if s.Rows != 1 || s.Cols != 1 {
+		t.Fatalf("Resize clamped to %dx%d, want 1x1", s.Rows, s.Cols)
+	}
+	if s.Cursor.Row < 0 || s.Cursor.Col < 0 {
+		t.Fatalf("cursor became negative: %+v", s.Cursor)
+	}
+}
+
+func TestScrollbackLimitClampsViewOffset(t *testing.T) {
+	s := NewScreen(2, 3)
+	s.scrollback = [][]Cell{
+		cellsFromText("111", 3),
+		cellsFromText("222", 3),
+		cellsFromText("333", 3),
+	}
+	s.viewOffset = 3
+	s.SetScrollbackLimit(1)
+	if s.viewOffset != 1 {
+		t.Fatalf("viewOffset = %d, want 1 after scrollback shrink", s.viewOffset)
+	}
+}
