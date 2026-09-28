@@ -258,10 +258,10 @@
         <p>The <code>saveImageBytes</code> function:</p>
         <ul>
             <li>Validates PNG data using <code>image.DecodeConfig</code></li>
-            <li>Creates a temp directory under <code>os.TempDir()</code> named <code>automata-clip</code></li>
-            <li>Saves image with timestamp-based filename</li>
+            <li>Creates a temp directory under <code>os.TempDir()</code> named <code>portalis-clip</code></li>
+            <li>Saves image with an atomic os.CreateTemp filename</li>
             <li>Decodes and re-encodes via PNG to strip any invalid bytes</li>
-            <li>Permissions: 0600 for files, 0755 for directories</li>
+            <li>Permissions: 0600 for files, 0700 for directories</li>
         </ul>
 
         <h3>Error Handling</h3>
