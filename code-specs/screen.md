@@ -407,3 +407,28 @@ s.SetSync(false) // восстановление последнего кадра
 - Размер одного grapheme cluster ограничен \`maxGraphemeBytes\` (4096 байт), чтобы combining/ZWJ flood не создавал неограниченное потребление памяти.
 - При уменьшении scrollback limit \`viewOffset\` clamp'ится к новому размеру.
 - Mouse state хранит DEC modes 1000/1002/1003 и SGR flag 1006; Emulator использует их для маршрутизации событий.
+
+
+## DEC state model
+
+- Main/alternate buffers have independent screen snapshots. \`?1049\` uses a
+  dedicated alt-screen save slot and therefore cannot overwrite the DECSC/DECRC
+  saved cursor.
+- Entering alternate screen saves main cursor, scroll region, origin mode,
+  autowrap and wrap-pending; exiting restores and clamps them to the current
+  dimensions.
+- DECSC/DECRC saves the full cursor rendition plus origin/autowrap/wrap state.
+- \`originMode\` constrains vertical cursor addressing/movement to DECSTBM.
+- \`autoWrap\` defaults to true; DECRST \`?7\` saturates writes at the right edge.
+
+## Background Color Erase
+
+Erase, inserted blank cells/lines, scroll-created blank rows and whole-screen
+clear use the current cursor background color (BCE) rather than zero-value
+cells. This keeps \`TERM=xterm-256color\` colored TUI redraws visually coherent.
+
+## Wide cells on resize
+
+All active, saved and scrollback rows are sanitized after resize. If a resize
+cuts between a wide base and its continuation, **both** the orphan continuation
+and the now-invalid wide base are removed.
