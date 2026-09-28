@@ -263,7 +263,7 @@ func (e *Emulator) spawnPty(extraEnv []string) (*Pty, error) {
 	// Bash OSC 7 emitter. PWD is percent-encoded byte-by-byte before it is
 	// placed inside the control sequence, so unusual filenames cannot inject
 	// BEL/ESC or terminate the OSC payload. Preserve any caller PROMPT_COMMAND.
-	osc7Cmd := `__p="$PWD";__o="";LC_ALL=C;for ((__i=0;__i<${#__p};__i++));do __c=${__p:__i:1};case "$__c" in [a-zA-Z0-9/~._-])__o+="$__c";;*)printf -v __h '%%%02X' "'$__c";__o+="$__h";;esac;done;printf '\033]7;file://%s%s\007' "${HOSTNAME:-localhost}" "$__o";unset __p __o __i __c __h`
+	osc7Cmd := `__o=$(LC_ALL=C;__p="$PWD";__r="";for ((__i=0;__i<${#__p};__i++));do __c=${__p:__i:1};case "$__c" in [a-zA-Z0-9/~._-])__r+="$__c";;*)printf -v __h '%%%02X' "'$__c";__r+="$__h";;esac;done;printf '%s' "$__r");printf '\033]7;file://localhost%s\007' "$__o";unset __o`
 	if e.cmd == "/bin/bash" || e.cmd == "/usr/bin/bash" || strings.HasSuffix(e.cmd, "/bash") {
 		if previous, ok := envValue(extraEnv, "PROMPT_COMMAND"); ok && strings.TrimSpace(previous) != "" {
 			osc7Cmd += ";" + previous
