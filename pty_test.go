@@ -138,7 +138,6 @@ func TestPtyListenHandlesClosedErrorChannel(t *testing.T) {
 	}
 }
 
-
 func TestPtyListenDrainsBufferedOutputBeforeExit(t *testing.T) {
 	p := &Pty{
 		Output:   make(chan []byte, 2),
