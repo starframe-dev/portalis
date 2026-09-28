@@ -677,7 +677,7 @@ func (p *Parser) clearFromCursor() {
 	col := p.screen.Cursor.Col
 	p.screen.clearCellRange(row, col, p.screen.Cols)
 	for r := row + 1; r < p.screen.Rows; r++ {
-		clear(p.screen.Cells[r])
+		p.screen.fillBlank(p.screen.Cells[r], 0, p.screen.Cols)
 	}
 }
 
