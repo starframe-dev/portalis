@@ -75,8 +75,8 @@ type Emulator struct {
 
 	// listenerPending prevents multiple Bubble Tea commands from reading the
 	// same PTY output channel concurrently.
-	listenerPending    bool
-	listenerGeneration uint64
+	listenerPending     bool
+	listenerGeneration  uint64
 	lifecycleGeneration uint64
 
 	// Drag-select state: remember the press position and whether an
