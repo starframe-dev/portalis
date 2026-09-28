@@ -271,3 +271,45 @@ func TestParserBoundsUnterminatedCSI(t *testing.T) {
 		t.Fatalf("CSI buffer grew to %d bytes", p.buf.Len())
 	}
 }
+
+
+func TestANSI256ColorXtermCube(t *testing.T) {
+	tests := map[int]string{
+		16:  "#000000",
+		17:  "#00005f",
+		21:  "#0000ff",
+		196: "#ff0000",
+		231: "#ffffff",
+	}
+	for index, want := range tests {
+		if got := string(ansi256Color(index)); got != want {
+			t.Errorf("ansi256Color(%d) = %q, want %q", index, got, want)
+		}
+	}
+}
+
+func TestParserMousePrivateModes(t *testing.T) {
+	s := NewScreen(2, 10)
+	p := NewParser(s)
+	p.Feed([]byte("[?1002;1006h"))
+	if s.mouseTrackingMode() != 1002 || !s.mouseSGR {
+		t.Fatalf("mouse modes not enabled: tracking=%d sgr=%v", s.mouseTrackingMode(), s.mouseSGR)
+	}
+	p.Feed([]byte("[?1002;1006l"))
+	if s.mouseTrackingMode() != 0 || s.mouseSGR {
+		t.Fatalf("mouse modes not disabled: tracking=%d sgr=%v", s.mouseTrackingMode(), s.mouseSGR)
+	}
+}
+
+func TestOSC7PercentDecodedAndControlsRejected(t *testing.T) {
+	if got := extractOSC7Path("file://localhost/tmp/a%20b"); got != "/tmp/a b" {
+		t.Fatalf("decoded OSC 7 path = %q, want /tmp/a b", got)
+	}
+	if got := extractOSC7Path("file://localhost/tmp/bad%1Bname"); got != "" {
+		t.Fatalf("OSC 7 control path accepted: %q", got)
+	}
+	if got := extractOSC7Path("/tmp/bad
+name"); got != "" {
+		t.Fatalf("raw OSC 7 newline path accepted: %q", got)
+	}
+}
