@@ -870,7 +870,6 @@ func (s *Screen) SetCursor(row, col int) {
 	if col >= s.Cols {
 		col = s.Cols - 1
 	}
-	s.Cursor = s.savedCursor
 	s.Cursor.Row = row
 	s.Cursor.Col = col
 	s.wrapPending = false
@@ -1144,6 +1143,7 @@ func (s *Screen) RestoreCursor() {
 	if col >= s.Cols {
 		col = s.Cols - 1
 	}
+	s.Cursor = s.savedCursor
 	s.Cursor.Row = row
 	s.Cursor.Col = col
 	s.wrapPending = false
