@@ -1,8 +1,8 @@
 package portalis
 
 import (
-	"os"
 	"errors"
+	"os"
 	"sync/atomic"
 	"testing"
 	"time"
