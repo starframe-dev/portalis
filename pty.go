@@ -2,7 +2,6 @@ package portalis
 
 import (
 	"bufio"
-	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -184,13 +183,6 @@ func (p *Pty) readLoop() {
 			}
 			if p.rawTraceChunks != nil {
 				_, _ = fmt.Fprintf(p.rawTraceChunks, "%d\n", len(data))
-			}
-
-			if bytes.Contains(data, []byte("\x1b[6n")) {
-				_ = p.Write([]byte("\x1b[1;1R"))
-			}
-			if bytes.Contains(data, []byte("\x1b[5n")) {
-				_ = p.Write([]byte("\x1b[0n"))
 			}
 
 			select {
