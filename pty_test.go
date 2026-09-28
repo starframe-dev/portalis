@@ -101,7 +101,6 @@ func TestPtyResizeAppliesEveryDistinctFinalSize(t *testing.T) {
 	}
 }
 
-
 func TestPtyCloseIsIdempotent(t *testing.T) {
 	p := &Pty{done: make(chan struct{})}
 	if err := p.Close(); err != nil {
