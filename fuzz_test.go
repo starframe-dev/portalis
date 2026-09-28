@@ -1,6 +1,9 @@
 package portalis
 
-import "testing"
+import (
+	"reflect"
+	"testing"
+)
 
 func FuzzParserFeed(f *testing.F) {
 	for _, seed := range [][]byte{
@@ -29,7 +32,17 @@ func FuzzParserFeed(f *testing.F) {
 			mid := len(data) / 2
 			parser2.Feed(data[:mid])
 			parser2.Feed(data[mid:])
-			_ = screen2.Render()
+
+			wholeRender := screen.Render()
+			splitRender := screen2.Render()
+			if wholeRender != splitRender ||
+				screen.Cursor != screen2.Cursor ||
+				parser.state != parser2.state ||
+				parser.buf.String() != parser2.buf.String() ||
+				!reflect.DeepEqual(parser.utf8Buf, parser2.utf8Buf) {
+				t.Fatalf("chunk-boundary semantic mismatch")
+			}
+			return
 		}
 		_ = screen.Render()
 	})
