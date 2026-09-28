@@ -60,9 +60,9 @@ func SpawnInDir(command string, args []string, dir string, env ...string) (*Pty,
 	}
 
 	p := &Pty{
-		cmd:    cmd,
-		ptmx:   ptmx,
-		reader: bufio.NewReader(ptmx),
+		cmd:      cmd,
+		ptmx:     ptmx,
+		reader:   bufio.NewReader(ptmx),
 		Output:   make(chan []byte, 64),
 		Errors:   make(chan error, 1),
 		done:     make(chan struct{}),
