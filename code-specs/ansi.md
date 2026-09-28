@@ -82,7 +82,8 @@ const (
     stateEscape                   // 1 — ожидание '[' или ']'
     stateCSI                      // 2 — внутри CSI-последовательности
     stateOSC                      // 3 — внутри OSC-последовательности
-    statePaste                    // 4 — внутри bracketed paste
+    stateString                   // 4 — игнорируемый DCS/SOS/PM/APC payload
+    stateStringEscape             // 5 — ESC внутри string control, ожидание ST
 )
 ```
 
@@ -308,10 +309,13 @@ func (p *Parser) clearFromCursor()
 | Параметр | Режим |
 |----------|-------|
 | `1` | application cursor keys |
+| `6` | origin mode (DECOM) |
+| `7` | autowrap (DECAWM) |
 | `25` | видимость курсора |
 | `1000` | mouse press/release tracking |
 | `1002` | mouse button-motion tracking |
 | `1003` | mouse all-motion tracking |
+| `1004` | focus reporting |
 | `1006` | SGR mouse encoding |
 | `1049` | альтернативный буфер экрана |
 | `2004` | bracketed paste |
@@ -396,13 +400,13 @@ OSC 7 ;/absolute/path BEL
 
 ## Bracketed paste
 
-При вхождении в `statePaste` каждый входящий байт эмитируется как rune через `screen.Put()`.
+Bracketed paste — это **input protocol**, а не режим разбора output. Когда child
+включает DECSET `?2004`, `Emulator` оборачивает вставляемый пользователем текст
+в `CSI 200~ ... CSI 201~` перед записью в PTY.
 
-Выход из состояния:
-```
-CSI 201~ → stateNormal
-CSI 200~ → statePaste
-```
+Если такие delimiters встречаются в output child-процесса, Parser поглощает сами
+CSI-последовательности и продолжает обычный UTF-8/ANSI parsing; отдельного
+`statePaste` нет.
 
 ---
 
@@ -472,3 +476,32 @@ CSI 200~ → statePaste
 - Invalid UTF-8 восстанавливается через replacement rune без накопления неограниченного \`utf8Buf\`.
 - OSC 7 path percent-decode'ится как URL path и отклоняется при NUL, BEL, ESC, CR или LF.
 - 256-color cube соответствует xterm, а RGB компоненты clamp'ятся к 0…255.
+
+
+## Terminal replies
+
+Parser может получать неблокирующий response callback через \`SetResponseCallback\`.
+Это позволяет корректно отвечать независимо от PTY read boundaries:
+
+- \`CSI 5 n\` → \`CSI 0 n\`;
+- \`CSI 6 n\` → фактический \`CSI row;col R\`;
+- \`CSI c\` → primary device attributes;
+- \`CSI > c\` → secondary device attributes.
+
+Ответы queue'ятся Emulator'ом во время \`Parser.Feed\` и записываются в PTY после
+снятия mutex.
+
+## String controls
+
+7-bit \`DCS (ESC P)\`, \`SOS (ESC X)\`, \`PM (ESC ^)\`, \`APC (ESC _)\`, а
+также соответствующие C1 формы, игнорируются до ST. Payload никогда не попадает
+на экран. OSC поддерживает BEL, \`ESC \\\` и C1 ST как terminator.
+
+## Additional xterm/VT semantics
+
+- \`CSI Ps b\` (REP) повторяет предыдущий grapheme cluster.
+- ED2 очищает display без перемещения cursor.
+- ED1 и ED3 поддерживаются; ED3 очищает scrollback.
+- DECSC/DECRC сохраняют position, SGR, origin/autowrap state и активные G0/G1 charsets.
+- CUP/HVP/VPA учитывают DECOM и активный scroll region.
+- BCE применяется к erase/insert/delete/scroll-created blank cells.
