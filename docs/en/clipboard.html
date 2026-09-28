@@ -261,7 +261,7 @@
             <li>Creates a temp directory under <code>os.TempDir()</code> named <code>automata-clip</code></li>
             <li>Saves image with timestamp-based filename</li>
             <li>Decodes and re-encodes via PNG to strip any invalid bytes</li>
-            <li>Permissions: 0644 for files, 0755 for directories</li>
+            <li>Permissions: 0600 for files, 0755 for directories</li>
         </ul>
 
         <h3>Error Handling</h3>
@@ -285,7 +285,7 @@
         <h2>Temporary Files</h2>
 
         <p>Images are saved to a temporary directory:</p>
-        <pre><code class="language-typescript">/tmp/automata-clip/</code></pre>
+        <pre><code class="language-typescript">/tmp/portalis-clip/</code></pre>
 
         <p>Files are named with timestamps and are cleaned up on save failure or when the function returns an error.</p>
 
