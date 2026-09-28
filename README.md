@@ -10,7 +10,7 @@ and forwards keyboard, mouse and resize events.
 - PTY-backed session via [`creack/pty`](https://github.com/creack/pty)
 - ANSI/VT parser: CSI, OSC, SGR colors (16 / 256 / 24-bit), UTF-8
 - xterm-compatible key encoding (Ctrl/Alt/Shift/F-keys, application cursor mode)
-- DEC modes: `?1` application cursor, `?25` cursor visibility, `?1049` alt screen, `?2004` bracketed paste, `?2026` synchronized output
+- DEC modes: `?1` application cursor, `?6` origin, `?7` autowrap, `?25` cursor visibility, `?1000/1002/1003/1006` mouse, `?1004` focus, `?1049` alt screen, `?2004` bracketed paste, `?2026` synchronized output
 - Editing sequences: ICH (`CSI @`), DCH (`CSI P`), ECH (`CSI X`), IL (`CSI L`), DL (`CSI M`), SU (`CSI S`), SD (`CSI T`), VPA (`CSI d`), HPA (`CSI G`)
 - Scroll regions, index/reverse index, DEC Special Graphics charset
 - OSC 7 working-directory tracking with callbacks
@@ -27,31 +27,64 @@ and forwards keyboard, mouse and resize events.
 go get github.com/starframe-dev/portalis
 ```
 
-Requires Go 1.25.8 or later.
+Requires Go 1.25.8 or later. PTY process support currently targets Unix-like systems (Linux and macOS); Windows is not supported.
 
 ## Quick start
 
+`Emulator` is an embeddable terminal component, **not** a `tea.Model` by
+itself. A host model forwards Bubble Tea messages, sends the allocated content
+size as `ResizeMsg`, and renders with `View(width, height)`:
+
 ```go
+package main
+
 import (
+    "log"
+
     tea "github.com/charmbracelet/bubbletea"
     "github.com/starframe-dev/portalis"
 )
 
-em := portalis.NewEmulator("session-1", "build", "bash", []string{"-l"})
-
-em.OnCWDChange = func(dir string) {
-    fmt.Println("cwd:", dir)
+type model struct {
+    term *portalis.Emulator
+    w, h int
 }
 
-p := tea.NewProgram(em, tea.WithAltScreen())
-if _, err := p.Run(); err != nil {
-    log.Fatal(err)
+func newModel() *model {
+    term := portalis.NewEmulator("session-1", "build", "bash", []string{"-l"})
+    term.OnError = func(err error) { log.Printf("terminal: %v", err) }
+    return &model{term: term}
+}
+
+func (m *model) Init() tea.Cmd {
+    return m.term.Start()
+}
+
+func (m *model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+    switch msg := msg.(type) {
+    case tea.WindowSizeMsg:
+        m.w, m.h = msg.Width, msg.Height
+        return m, m.term.Update(portalis.ResizeMsg{Width: m.w, Height: m.h})
+    default:
+        return m, m.term.Update(msg)
+    }
+}
+
+func (m *model) View() string {
+    return m.term.View(m.w, m.h)
+}
+
+func main() {
+    if _, err := tea.NewProgram(newModel(), tea.WithAltScreen()).Run(); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
-The host calls `Update(msg)` with `tea.KeyMsg`, `tea.MouseMsg`, `ResizeMsg`,
-`PtyOutputMsg`, `PtyExitMsg`, and `CursorBlinkMsg`. Render any time with
-`View(width, height)`.
+The returned commands produce `PtyReadyMsg`, `PtyOutputMsg`,
+`PtyExitMsg`, clipboard errors, and other internal messages; route those
+messages back through `Emulator.Update`. System clipboard paste is explicit
+via `PasteFromClipboard()`; ordinary `Ctrl+V` is forwarded to the child.
 
 ## Architecture
 
@@ -61,7 +94,7 @@ The host calls `Update(msg)` with `tea.KeyMsg`, `tea.MouseMsg`, `ResizeMsg`,
 | `screen.go` | 2D cell grid, scrollback, selection, rendering, dirty cache. |
 | `ansi.go` | ANSI/VT escape parser (CSI, OSC, SGR, UTF-8, DEC modes). |
 | `pty.go` | PTY spawn / ordered reads / write / resize / lifecycle. |
-| `clipboard.go` | OSC 52 with platform backends. |
+| `clipboard.go` | System clipboard backends and explicit paste/copy integration. |
 
 ```
 ┌────────────────── Emulator ──────────────────┐
