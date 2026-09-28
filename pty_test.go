@@ -100,3 +100,39 @@ func TestPtyResizeAppliesEveryDistinctFinalSize(t *testing.T) {
 		t.Fatalf("recorded size = %dx%d, want 40x120", p.lastRows, p.lastCols)
 	}
 }
+
+
+func TestPtyCloseIsIdempotent(t *testing.T) {
+	p := &Pty{done: make(chan struct{})}
+	if err := p.Close(); err != nil {
+		t.Fatalf("first Close: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("second Close: %v", err)
+	}
+}
+
+func TestPtyResizeRejectsInvalidDimensions(t *testing.T) {
+	p := &Pty{ptmx: &os.File{}}
+	for _, size := range [][2]int{{0, 80}, {24, 0}, {-1, 80}, {24, 70000}} {
+		if err := p.Resize(size[0], size[1]); err == nil {
+			t.Fatalf("Resize(%d, %d) unexpectedly succeeded", size[0], size[1])
+		}
+	}
+}
+
+func TestPtyListenHandlesClosedErrorChannel(t *testing.T) {
+	p := &Pty{
+		Output: make(chan []byte),
+		Errors: make(chan error),
+	}
+	close(p.Errors)
+	msg := p.Listen("session")()
+	exit, ok := msg.(PtyExitMsg)
+	if !ok {
+		t.Fatalf("message type = %T, want PtyExitMsg", msg)
+	}
+	if exit.SessionID != "session" {
+		t.Fatalf("session = %q, want session", exit.SessionID)
+	}
+}
