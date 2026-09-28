@@ -397,3 +397,13 @@ s.SetSync(true)
 // любые изменения не влияют на отображение
 s.SetSync(false) // восстановление последнего кадра
 ```
+
+
+## Hardening invariants
+
+- \`NewScreen\` и \`Resize\` clamp'ят размеры минимум к 1×1; публичный API не создаёт отрицательные cursor/scroll-region значения.
+- При \`?1049\` alternate screen основной buffer сохраняется отдельно; resize изменяет размеры active и saved buffer согласованно.
+- Прокрутка alternate screen не добавляет строки в основной scrollback.
+- Размер одного grapheme cluster ограничен \`maxGraphemeBytes\` (4096 байт), чтобы combining/ZWJ flood не создавал неограниченное потребление памяти.
+- При уменьшении scrollback limit \`viewOffset\` clamp'ится к новому размеру.
+- Mouse state хранит DEC modes 1000/1002/1003 и SGR flag 1006; Emulator использует их для маршрутизации событий.
