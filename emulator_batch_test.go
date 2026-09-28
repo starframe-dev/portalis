@@ -2,12 +2,11 @@ package portalis
 
 import (
 	"os"
-	"time"
-
-	tea "github.com/charmbracelet/bubbletea"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 )
 
 func TestPtyOutputFeedsParserImmediatelyAndContinuesListener(t *testing.T) {
