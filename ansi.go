@@ -1,6 +1,7 @@
 package portalis
 
 import (
+	"net/url"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -315,18 +316,24 @@ func (p *Parser) handleOSC(payload string) {
 //	/absolute/path        → /absolute/path
 func extractOSC7Path(s string) string {
 	s = strings.TrimSpace(s)
+	var path string
 	if strings.HasPrefix(s, "file://") {
-		// Strip scheme and hostname.
-		s = s[len("file://"):]
-		if i := strings.IndexByte(s, '/'); i >= 0 {
-			return s[i:]
+		u, err := url.Parse(s)
+		if err != nil || u.Scheme != "file" {
+			return ""
 		}
+		path = u.Path
+	} else if filepath.IsAbs(s) {
+		path = s
+	} else {
 		return ""
 	}
-	if filepath.IsAbs(s) {
-		return s
+	for _, r := range path {
+		if r == 0 || r == '\x1b' || r == '\x07' || r == '\r' || r == '\n' {
+			return ""
+		}
 	}
-	return ""
+	return path
 }
 
 func (p *Parser) handleCSI(seq string) {
@@ -522,6 +529,14 @@ func (p *Parser) setPrivateMode(mode int, active bool) {
 		} else {
 			p.screen.ExitAltScreen()
 		}
+	case 1000:
+		p.screen.mouseMode1000 = active
+	case 1002:
+		p.screen.mouseMode1002 = active
+	case 1003:
+		p.screen.mouseMode1003 = active
+	case 1006:
+		p.screen.mouseSGR = active
 	case 2004:
 		p.screen.bracketedPaste = active
 	case 2026:
@@ -669,12 +684,13 @@ func ansi256Color(n int) lipgloss.Color {
 		return lipgloss.Color(colors[n])
 	}
 	if n < 232 {
-		// 6x6x6 color cube
+		// xterm 6x6x6 color cube: 0, 95, 135, 175, 215, 255.
+		levels := [...]int{0, 95, 135, 175, 215, 255}
 		n -= 16
 		r := n / 36
 		g := (n / 6) % 6
 		b := n % 6
-		return lipgloss.Color(rgb(r*42+12, g*42+12, b*42+12))
+		return lipgloss.Color(rgb(levels[r], levels[g], levels[b]))
 	}
 	// Grayscale
 	v := (n-232)*10 + 8
