@@ -1,6 +1,7 @@
 package portalis
 
 import (
+	"bytes"
 	"strings"
 	"testing"
 
@@ -226,5 +227,48 @@ func TestParserTmuxModesAndFrame(t *testing.T) {
 	}
 	if got := s.RenderLine(1); got != "status          " {
 		t.Fatalf("frame row 1 = %q", got)
+	}
+}
+
+
+func TestParserInvalidUTF8DoesNotAccumulate(t *testing.T) {
+	s := NewScreen(2, 20)
+	p := NewParser(s)
+	p.Feed(bytes.Repeat([]byte{0xff}, 1024))
+	if len(p.utf8Buf) != 0 {
+		t.Fatalf("invalid UTF-8 buffer retained %d bytes", len(p.utf8Buf))
+	}
+}
+
+func TestParserFlushesIncompleteUTF8BeforeASCII(t *testing.T) {
+	s := NewScreen(1, 10)
+	p := NewParser(s)
+	p.Feed([]byte{0xc2})
+	p.Feed([]byte("A"))
+	if len(p.utf8Buf) != 0 {
+		t.Fatalf("incomplete UTF-8 buffer retained %d bytes", len(p.utf8Buf))
+	}
+	if got := s.Cells[0][1].Rune; got != 'A' {
+		t.Fatalf("ASCII after incomplete UTF-8 = %q, want A", got)
+	}
+}
+
+func TestParserBoundsUnterminatedOSC(t *testing.T) {
+	s := NewScreen(1, 10)
+	p := NewParser(s)
+	payload := append([]byte("\x1b]7;"), bytes.Repeat([]byte{'x'}, maxOSCSequenceBytes+1024)...)
+	p.Feed(payload)
+	if p.buf.Len() > maxOSCSequenceBytes {
+		t.Fatalf("OSC buffer grew to %d bytes", p.buf.Len())
+	}
+}
+
+func TestParserBoundsUnterminatedCSI(t *testing.T) {
+	s := NewScreen(1, 10)
+	p := NewParser(s)
+	payload := append([]byte("\x1b["), bytes.Repeat([]byte{'1'}, maxCSISequenceBytes+1024)...)
+	p.Feed(payload)
+	if p.buf.Len() > maxCSISequenceBytes {
+		t.Fatalf("CSI buffer grew to %d bytes", p.buf.Len())
 	}
 }
