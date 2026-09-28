@@ -1,6 +1,7 @@
 package portalis
 
 import (
+	"fmt"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -17,11 +18,15 @@ type Parser struct {
 	buf                strings.Builder
 	utf8Buf            []byte
 	onCWD              func(string)
+	onResponse         func([]byte)
 	lastCWD            string
 	escapeIntermediate byte
 	g0LineDrawing      bool
 	g1LineDrawing      bool
 	useG1              bool
+	savedG0LineDrawing bool
+	savedG1LineDrawing bool
+	savedUseG1         bool
 }
 
 type ansiState int
@@ -37,7 +42,8 @@ const (
 	stateEscapeIntermediate
 	stateCSI
 	stateOSC
-	statePaste
+	stateString
+	stateStringEscape
 )
 
 // NewParser creates a new ANSI parser for the given screen.
@@ -50,15 +56,41 @@ func (p *Parser) SetCWDCallback(fn func(string)) {
 	p.onCWD = fn
 }
 
+// SetResponseCallback receives terminal-generated replies such as DSR/DA.
+// The callback must not block; Emulator queues replies and writes them after
+// releasing its state mutex.
+func (p *Parser) SetResponseCallback(fn func([]byte)) {
+	p.onResponse = fn
+}
+
+func (p *Parser) respond(data []byte) {
+	if p.onResponse == nil || len(data) == 0 {
+		return
+	}
+	p.onResponse(append([]byte(nil), data...))
+}
+
+func (p *Parser) saveCursorState() {
+	p.screen.SaveCursor()
+	p.savedG0LineDrawing = p.g0LineDrawing
+	p.savedG1LineDrawing = p.g1LineDrawing
+	p.savedUseG1 = p.useG1
+}
+
+func (p *Parser) restoreCursorState() {
+	p.screen.RestoreCursor()
+	p.g0LineDrawing = p.savedG0LineDrawing
+	p.g1LineDrawing = p.savedG1LineDrawing
+	p.useG1 = p.savedUseG1
+}
+
 // flushUtf8 flushes any incomplete UTF-8 sequence as replacement chars.
 func (p *Parser) flushUtf8() {
 	if len(p.utf8Buf) == 0 {
 		return
 	}
-	// Incomplete sequence — emit replacement characters.
-	for range p.utf8Buf {
-		p.screen.Put('\ufffd')
-	}
+	// Incomplete sequence — emit one replacement rune for the invalid scalar.
+	p.screen.Put('\ufffd')
 	p.utf8Buf = p.utf8Buf[:0]
 }
 
@@ -166,6 +198,25 @@ func (p *Parser) feedByte(b byte) {
 			return
 		}
 
+		// Accept 8-bit C1 forms when they are not part of a pending UTF-8
+		// sequence. Modern programs usually use 7-bit ESC forms, but xterm
+		// compatibility permits both.
+		if len(p.utf8Buf) == 0 {
+			switch b {
+			case 0x90, 0x98, 0x9e, 0x9f: // DCS, SOS, PM, APC
+				p.state = stateString
+				return
+			case 0x9b: // CSI
+				p.state = stateCSI
+				p.buf.Reset()
+				return
+			case 0x9d: // OSC
+				p.state = stateOSC
+				p.buf.Reset()
+				return
+			}
+		}
+
 		// Collect UTF-8 multi-byte sequences.
 		if b >= 0x80 {
 			p.utf8Buf = append(p.utf8Buf, b)
@@ -207,9 +258,12 @@ func (p *Parser) feedByte(b byte) {
 		}
 		switch b {
 		case '7':
-			p.screen.SaveCursor()
+			p.saveCursorState()
 		case '8':
-			p.screen.RestoreCursor()
+			p.restoreCursorState()
+		case 'P', 'X', '^', '_': // DCS, SOS, PM, APC: ignore until ST
+			p.state = stateString
+			return
 		case 'D':
 			p.screen.Index()
 		case 'E':
@@ -254,19 +308,18 @@ func (p *Parser) feedByte(b byte) {
 			p.state = stateNormal
 			return
 		}
-		if b == '\x07' {
+		if b == '\x07' || b == 0x9c {
 			p.handleOSC(p.buf.String())
 			p.state = stateNormal
 			p.buf.Reset()
 			return
 		}
 		if b == '\x1b' {
-			// Expect \
+			// Expect ST (ESC \).
 			p.buf.WriteByte(b)
 			return
 		}
 		if b == '\\' && p.buf.Len() > 0 && p.buf.String()[p.buf.Len()-1] == 0x1b {
-			// Strip trailing ESC before handling.
 			payload := p.buf.String()
 			if len(payload) > 0 {
 				payload = payload[:len(payload)-1]
@@ -278,14 +331,20 @@ func (p *Parser) feedByte(b byte) {
 		}
 		p.buf.WriteByte(b)
 
-	case statePaste:
-		// Bracketed paste: data is inserted literally until ESC[201~.
-		if b == '\x1b' {
-			p.state = stateEscape
-			p.buf.Reset()
+	case stateString:
+		if b == 0x9c {
+			p.state = stateNormal
 			return
 		}
-		p.screen.Put(rune(b))
+		if b == '\x1b' {
+			p.state = stateStringEscape
+		}
+	case stateStringEscape:
+		if b == '\\' {
+			p.state = stateNormal
+		} else if b != '\x1b' {
+			p.state = stateString
+		}
 	}
 }
 
@@ -345,10 +404,12 @@ func (p *Parser) handleCSI(seq string) {
 
 	// Detect private marker (? for DEC private, >/< for other private forms).
 	isPrivate := false
+	var privateMarker byte
 	if len(rawParams) > 0 {
 		switch rawParams[0] {
 		case '?', '>', '<', '=', '!':
 			isPrivate = true
+			privateMarker = rawParams[0]
 			rawParams = rawParams[1:]
 		}
 	}
@@ -369,7 +430,7 @@ func (p *Parser) handleCSI(seq string) {
 		if len(params) > 1 {
 			col = params[1]
 		}
-		p.screen.SetCursor(row-1, col-1)
+		p.screen.SetCursorAddress(row-1, col-1)
 	case 'J':
 		n := 0
 		if len(params) > 0 {
@@ -378,9 +439,12 @@ func (p *Parser) handleCSI(seq string) {
 		switch n {
 		case 0:
 			p.clearFromCursor()
+		case 1:
+			p.screen.ClearToCursor()
 		case 2:
 			p.screen.Clear()
-			p.screen.SetCursor(0, 0)
+		case 3:
+			p.screen.ClearScrollback()
 		}
 	case 'K':
 		n := 0
@@ -442,7 +506,7 @@ func (p *Parser) handleCSI(seq string) {
 		if len(params) > 0 && params[0] > 0 {
 			row = params[0]
 		}
-		p.screen.SetCursor(row-1, p.screen.Cursor.Col)
+		p.screen.SetCursorAddress(row-1, p.screen.Cursor.Col)
 	case '@':
 		p.screen.InsertChars(firstParam(params, 1))
 	case 'P':
@@ -460,13 +524,34 @@ func (p *Parser) handleCSI(seq string) {
 	case 's':
 		// Save cursor (DECSC) — only standard sequences.
 		if !isPrivate {
-			p.screen.SaveCursor()
+			p.saveCursorState()
 		}
 	case 'u':
 		// Restore cursor (DECRC) — only standard sequences.
 		// Private forms like CSI ? u or CSI > 7 u are kitty keyboard protocol.
 		if !isPrivate {
-			p.screen.RestoreCursor()
+			p.restoreCursorState()
+		}
+	case 'b':
+		if !isPrivate {
+			p.screen.RepeatPrevious(firstParam(params, 1))
+		}
+	case 'n':
+		if !isPrivate {
+			n := firstParam(params, 0)
+			switch n {
+			case 5:
+				p.respond([]byte("\x1b[0n"))
+			case 6:
+				row, col := p.screen.CursorPos()
+				p.respond([]byte(fmt.Sprintf("\x1b[%d;%dR", row+1, col+1)))
+			}
+		}
+	case 'c':
+		if privateMarker == '>' {
+			p.respond([]byte("\x1b[>0;1;0c"))
+		} else if !isPrivate {
+			p.respond([]byte("\x1b[?1;2c"))
 		}
 	case 'r':
 		// Set scroll region (DECSTBM)
@@ -492,15 +577,9 @@ func (p *Parser) handleCSI(seq string) {
 			}
 		}
 	case '~':
-		// Bracketed paste sequences.
-		if len(params) > 0 {
-			switch params[0] {
-			case 200:
-				p.state = statePaste
-			case 201:
-				p.state = stateNormal
-			}
-		}
+		// Bracketed-paste delimiters belong to terminal input. If an
+		// application echoes them back, consume the control sequence without
+		// changing output parsing state.
 	}
 }
 
@@ -521,6 +600,10 @@ func (p *Parser) setPrivateMode(mode int, active bool) {
 	switch mode {
 	case 1:
 		p.screen.applicationCursor = active
+	case 6:
+		p.screen.SetOriginMode(active)
+	case 7:
+		p.screen.SetAutoWrap(active)
 	case 25:
 		p.screen.CursorVisible = active
 	case 1049:
@@ -535,6 +618,8 @@ func (p *Parser) setPrivateMode(mode int, active bool) {
 		p.screen.mouseMode1002 = active
 	case 1003:
 		p.screen.mouseMode1003 = active
+	case 1004:
+		p.screen.focusReporting = active
 	case 1006:
 		p.screen.mouseSGR = active
 	case 2004:
