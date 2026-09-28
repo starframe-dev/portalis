@@ -9,16 +9,15 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
 
 // copyToClipboard sends the given lines (newline-joined) to the system clipboard.
-func copyToClipboard(lines []string) {
+func copyToClipboard(lines []string) error {
 	text := strings.Join(lines, "\n")
 	if text == "" {
-		return
+		return nil
 	}
 	// Try macOS pbcopy first, then Linux xclip / xsel / wl-copy.
 	candidates := [][]string{
@@ -27,15 +26,22 @@ func copyToClipboard(lines []string) {
 		{"xsel", "--clipboard", "--input"},
 		{"wl-copy"},
 	}
+	var lastErr error
 	for _, cmd := range candidates {
 		if _, err := exec.LookPath(cmd[0]); err == nil {
 			c := exec.Command(cmd[0], cmd[1:]...)
 			c.Stdin = strings.NewReader(text)
 			if err := c.Run(); err == nil {
-				return
+				return nil
+			} else {
+				lastErr = err
 			}
 		}
 	}
+	if lastErr != nil {
+		return fmt.Errorf("copy clipboard: %w", lastErr)
+	}
+	return fmt.Errorf("no clipboard tool available")
 }
 
 // pasteFromClipboard returns the clipboard contents. If the clipboard
@@ -71,8 +77,12 @@ let candidates: [(NSPasteboard.PasteboardType, String)] = [
 ]
 for (t, ext) in candidates {
     if let data = pb.data(forType: t) {
+        if data.count > 104857600 {
+            print("ERR:clipboard image too large")
+            exit(1)
+        }
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("automata-paste-\(UUID().uuidString).\(ext)")
+            .appendingPathComponent("portalis-paste-\(UUID().uuidString).\(ext)")
         do {
             try data.write(to: url)
             print("PATH:\(url.path)")
@@ -180,7 +190,6 @@ func saveImageBytes(data []byte) (string, error) {
 	if len(data) > maxClipboardImageBytes {
 		return "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardImageBytes)
 	}
-	// Verify dimensions before full decoding to bound memory use.
 	config, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
 		return "", err
@@ -188,55 +197,74 @@ func saveImageBytes(data []byte) (string, error) {
 	if config.Width <= 0 || config.Height <= 0 || int64(config.Width)*int64(config.Height) > maxClipboardImagePixels {
 		return "", fmt.Errorf("clipboard image dimensions %dx%d exceed limit", config.Width, config.Height)
 	}
-	dir := filepath.Join(os.TempDir(), "automata-clip")
+	img, err := png.Decode(bytes.NewReader(data))
+	if err != nil {
+		return "", err
+	}
+	dir := filepath.Join(os.TempDir(), "portalis-clip")
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
-	name := fmt.Sprintf("paste-%d.png", time.Now().UnixNano())
-	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	file, err := os.CreateTemp(dir, "paste-*.png")
+	if err != nil {
 		return "", err
 	}
-	// Also decode & re-encode via png to confirm validity (drops any junk).
-	img, err := png.Decode(bytes.NewReader(data))
-	if err != nil {
+	path := file.Name()
+	if err := file.Chmod(0o600); err != nil {
+		_ = file.Close()
 		_ = os.Remove(path)
 		return "", err
 	}
-	f, err := os.Create(path)
-	if err != nil {
+	if err := png.Encode(file, img); err != nil {
+		_ = file.Close()
+		_ = os.Remove(path)
 		return "", err
 	}
-	defer f.Close()
-	if err := png.Encode(f, img); err != nil {
+	if err := file.Close(); err != nil {
 		_ = os.Remove(path)
 		return "", err
 	}
 	return path, nil
 }
 
-// handlePaste reads the clipboard and writes either the text or the image
-// file path to the PTY (bracketed paste for text, plain path for images).
-func (e *Emulator) handlePaste() tea.Cmd {
-	e.mu.Lock()
+// ClipboardErrorMsg reports a system clipboard failure without terminating PTY.
+type ClipboardErrorMsg struct {
+	Err error
+}
+
+// PasteFromClipboard asynchronously reads the system clipboard and writes its
+// text (or an image temp-file path) to the current PTY.
+func (e *Emulator) PasteFromClipboard() tea.Cmd {
+	e.mu.RLock()
 	pty := e.pty
-	e.mu.Unlock()
+	generation := e.listenerGeneration
+	bracketed := e.screen != nil && e.screen.bracketedPaste
+	e.mu.RUnlock()
 	if pty == nil {
 		return nil
 	}
 
-	text, imagePath, err := pasteFromClipboard()
-	if err != nil || (text == "" && imagePath == "") {
+	return func() tea.Msg {
+		text, imagePath, err := pasteFromClipboard()
+		if err != nil {
+			return ClipboardErrorMsg{Err: err}
+		}
+		if text == "" && imagePath == "" {
+			return nil
+		}
+
+		var payload []byte
+		if imagePath != "" {
+			payload = []byte(imagePath + "\n")
+		} else if bracketed {
+			payload = append([]byte("\x1b[200~"), []byte(text)...)
+			payload = append(payload, []byte("\x1b[201~")...)
+		} else {
+			payload = []byte(text)
+		}
+		if err := pty.Write(payload); err != nil {
+			return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
+		}
 		return nil
 	}
-
-	var payload []byte
-	if imagePath != "" {
-		payload = []byte(imagePath + "\n")
-	} else {
-		// Bracketed paste: ESC[200~ ... ESC[201~
-		payload = []byte("\x1b[200~" + text + "\x1b[201~")
-	}
-	pty.Write(payload)
-	return nil
 }
