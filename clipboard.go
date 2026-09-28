@@ -39,15 +39,19 @@ func commandOutputLimited(stdin string, name string, args ...string) ([]byte, er
 		return nil, err
 	}
 	data, readErr := io.ReadAll(io.LimitReader(stdout, int64(maxClipboardBytes)+1))
-	waitErr := cmd.Wait()
-	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-		return nil, fmt.Errorf("%s timed out", name)
-	}
 	if len(data) > maxClipboardBytes {
+		cancel()
+		_ = cmd.Wait()
 		return nil, fmt.Errorf("%s output exceeds %d bytes", name, maxClipboardBytes)
 	}
 	if readErr != nil {
+		cancel()
+		_ = cmd.Wait()
 		return nil, readErr
+	}
+	waitErr := cmd.Wait()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("%s timed out", name)
 	}
 	if waitErr != nil {
 		return nil, waitErr
@@ -156,6 +160,7 @@ func pasteMac() (string, string, error) {
 			_ = os.Chmod(path, 0o600)
 			return "", path, nil
 		}
+		_ = os.Remove(path)
 	}
 	out, err := commandOutputLimited("", "pbpaste")
 	if err != nil {
