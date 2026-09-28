@@ -27,7 +27,7 @@ and forwards keyboard, mouse and resize events.
 go get github.com/starframe-dev/portalis
 ```
 
-Requires Go 1.22 or later.
+Requires Go 1.23.12 or later.
 
 ## Quick start
 
