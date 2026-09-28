@@ -9,6 +9,13 @@ updates:
       go-dependencies:
         patterns:
           - "*"
+    ignore:
+      # Bubble Tea v1.3.10 and Lipgloss v1.1.0 currently require the
+      # 0.10.x ansi API through Charm's cellbuf stack. 0.11+ is source-
+      # incompatible; lift this when the direct Charm stack is upgraded.
+      - dependency-name: "github.com/charmbracelet/x/ansi"
+        versions:
+          - ">= 0.11.0"
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
