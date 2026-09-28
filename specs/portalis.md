@@ -213,8 +213,8 @@ Emulator использует Bubble Tea для обработки событи�
 ### 2. Состояние и синхронизация
 
 - `sync.RWMutex` защищает доступ к мутабельному состоянию
-- Parser не держит mutex во время парсинга (возвращает parser без mutex)
-- Callbackы из Parser могут вызывать методы Emulator (требуется синхронизация)
+- Generation check и `Parser.Feed` выполняются под одним `Emulator.mu`, чтобы stale PTY chunk не мог попасть в новый terminal state.
+- Parser callbacks только queue'ят CWD/terminal-response state; внешние callbacks и PTY writes выполняются после unlock.
 
 ### 3. Scrollback Management
 
@@ -309,3 +309,19 @@ Emulator использует Bubble Tea для обработки событи�
 - Grapheme cluster имеет ограничение размера, чтобы hostile terminal output не создавал неограниченные строки.
 - Mouse events передаются child process только после DECSET 1000/1002/1003; 1006 выбирает SGR encoding. Shift принудительно оставляет mouse event локальному selection/scrollback.
 - Публичные размеры Screen нормализуются минимум к 1×1.
+
+
+## VT/xterm compatibility hardening (2026-09-28)
+
+- DSR/CPR и DA обрабатываются Parser'ом, а не raw PTY chunk scanner'ом, поэтому
+  escape sequences могут пересекать read boundaries.
+- Поддерживаются DECOM \`?6\`, DECAWM \`?7\`, focus tracking \`?1004\`,
+  mouse 1000/1002/1003/1006, REP, BCE и ignored DCS/SOS/PM/APC strings.
+- Bracketed-paste delimiters являются input protocol и не переводят output
+  Parser в специальный paste-state.
+- Alternate screen имеет отдельный saved cursor/scroll region; DECSC/DECRC
+  сохраняют rendition и charset state.
+- PTY spawn выполняется вне Emulator mutex; lifecycle generation отменяет
+  in-flight/queued starts.
+- Clipboard subprocesses имеют byte/time bounds, generation guard и temp-file
+  cleanup.
