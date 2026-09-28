@@ -1,6 +1,10 @@
 package portalis
 
 import (
+	"os"
+	"time"
+
+	tea "github.com/charmbracelet/bubbletea"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -138,5 +142,76 @@ func TestPtyOutputOSC7DoesNotDeadlock(t *testing.T) {
 	})
 	if got := callbackCalls.Load(); got != 1 {
 		t.Fatalf("unchanged CWD callback calls = %d, want 1", got)
+	}
+}
+
+
+func TestStartEnvUsesDefensiveCopies(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	input := []string{"A=1"}
+	em.SetStartEnv(input)
+	input[0] = "MUTATED=1"
+	if got := em.StartEnv(); len(got) != 1 || got[0] != "A=1" {
+		t.Fatalf("stored env mutated through caller slice: %#v", got)
+	}
+	got := em.StartEnv()
+	got[0] = "MUTATED=2"
+	if again := em.StartEnv(); again[0] != "A=1" {
+		t.Fatalf("stored env mutated through getter slice: %#v", again)
+	}
+}
+
+func TestSetCommandHistoryUsesDefensiveCopy(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	history := []string{"echo safe"}
+	em.SetCommandHistory(history)
+	history[0] = "mutated"
+	em.mu.RLock()
+	got := em.commandHistory[0]
+	em.mu.RUnlock()
+	if got != "echo safe" {
+		t.Fatalf("stored history mutated through caller slice: %q", got)
+	}
+}
+
+func TestStalePtyOutputGenerationIsIgnored(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.resetTerminalLocked()
+	current := em.listenerGeneration
+	em.mu.Unlock()
+
+	em.Update(PtyOutputMsg{SessionID: "session", Generation: current - 1, Data: []byte("stale")})
+	if got := em.screen.RenderLine(0); got[:5] == "stale" {
+		t.Fatalf("stale PTY generation was rendered: %q", got)
+	}
+}
+
+func TestCommandHistoryCallbackMayReenterEmulator(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.resetTerminalLocked()
+	em.pty = &Pty{ptmx: w, done: make(chan struct{})}
+	em.screen.PutBytes([]byte("$ echo hi"))
+	em.mu.Unlock()
+	defer em.Close()
+
+	done := make(chan struct{})
+	em.OnCommandHistoryChanged = func(_ []string) {
+		_ = em.CWD()
+		close(done)
+	}
+
+	em.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("history callback deadlocked while re-entering Emulator")
 	}
 }
