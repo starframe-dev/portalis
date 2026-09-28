@@ -1,6 +1,6 @@
 module github.com/starframe-dev/portalis
 
-go 1.23.0
+go 1.23.12
 
 require (
 	github.com/charmbracelet/bubbletea v1.1.0
