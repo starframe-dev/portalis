@@ -2,6 +2,7 @@ package portalis
 
 import (
 	"os"
+	"errors"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -97,6 +98,7 @@ func TestPtyOutputOSC7DoesNotDeadlock(t *testing.T) {
 	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
 	emulator.mu.Lock()
 	emulator.resetTerminalLocked()
+	generation := emulator.listenerGeneration
 	emulator.pty = &Pty{}
 	emulator.mu.Unlock()
 
@@ -110,8 +112,9 @@ func TestPtyOutputOSC7DoesNotDeadlock(t *testing.T) {
 	finished := make(chan bool, 1)
 	go func() {
 		cmd := emulator.Update(PtyOutputMsg{
-			SessionID: "session",
-			Data:      []byte("\x1b]7;/tmp/project\x07prompt"),
+			SessionID:  "session",
+			Generation: generation,
+			Data:       []byte("\x1b]7;/tmp/project\x07prompt"),
 		})
 		finished <- cmd != nil
 	}()
@@ -136,8 +139,9 @@ func TestPtyOutputOSC7DoesNotDeadlock(t *testing.T) {
 	}
 
 	emulator.Update(PtyOutputMsg{
-		SessionID: "session",
-		Data:      []byte("\x1b]7;/tmp/project\x07"),
+		SessionID:  "session",
+		Generation: generation,
+		Data:       []byte("\x1b]7;/tmp/project\x07"),
 	})
 	if got := callbackCalls.Load(); got != 1 {
 		t.Fatalf("unchanged CWD callback calls = %d, want 1", got)
@@ -274,5 +278,82 @@ func TestMouseTrackingRules(t *testing.T) {
 	}
 	if !shouldReportMouse(1003, motionNone) {
 		t.Fatal("buttonless motion not reported in mode 1003")
+	}
+}
+
+func TestNewEmulatorCopiesArgs(t *testing.T) {
+	args := []string{"-c", "echo safe"}
+	em := NewEmulator("session", "Session", "/bin/sh", args)
+	args[1] = "mutated"
+	if got := em.args[1]; got != "echo safe" {
+		t.Fatalf("emulator args mutated through caller slice: %q", got)
+	}
+}
+
+func TestGenerationZeroDoesNotBypassRestartGuard(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.resetTerminalLocked()
+	em.mu.Unlock()
+
+	em.Update(PtyOutputMsg{SessionID: "session", Generation: 0, Data: []byte("stale")})
+	if got := em.screen.LineText(0); got != "" {
+		t.Fatalf("generation-zero stale output was accepted: %q", got)
+	}
+}
+
+func TestLegacyMouseReleaseUsesReleaseButtonCode(t *testing.T) {
+	msg := tea.MouseMsg{X: 1, Y: 2, Action: tea.MouseActionRelease, Button: tea.MouseButtonLeft}
+	got := mouseToBytes(msg, false)
+	want := []byte{0x1b, '[', 'M', 35, 34, 35}
+	if string(got) != string(want) {
+		t.Fatalf("legacy release = %v, want %v", got, want)
+	}
+}
+
+func TestFocusReportingWritesDECSequence(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	defer w.Close()
+
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.screen = NewScreen(2, 10)
+	em.screen.focusReporting = true
+	em.pty = &Pty{ptmx: w}
+	em.mu.Unlock()
+
+	cmd := em.Focus()
+	if cmd == nil {
+		t.Fatal("Focus returned nil while ?1004 reporting enabled")
+	}
+	if msg := cmd(); msg != nil {
+		t.Fatalf("focus command returned %T, want nil", msg)
+	}
+
+	buf := make([]byte, 3)
+	if _, err := r.Read(buf); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(buf); got != "[I" {
+		t.Fatalf("focus report = %q, want ESC[I", got)
+	}
+}
+
+func TestErrorMessagesReachOnError(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	var calls atomic.Int32
+	em.OnError = func(err error) {
+		if err != nil {
+			calls.Add(1)
+		}
+	}
+	em.Update(ClipboardErrorMsg{Err: errors.New("clipboard")})
+	em.Update(PtyErrorMsg{Err: errors.New("pty")})
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("OnError calls = %d, want 2", got)
 	}
 }
