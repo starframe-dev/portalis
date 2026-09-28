@@ -214,7 +214,6 @@ func TestCommandHistoryCallbackMayReenterEmulator(t *testing.T) {
 	}
 }
 
-
 func TestStopCancelsQueuedStartCommand(t *testing.T) {
 	em := NewEmulator("session", "Session", "/bin/sh", nil)
 	cmd := em.Start()
