@@ -144,7 +144,6 @@ func TestPtyOutputOSC7DoesNotDeadlock(t *testing.T) {
 	}
 }
 
-
 func TestStartEnvUsesDefensiveCopies(t *testing.T) {
 	em := NewEmulator("session", "Session", "/bin/sh", nil)
 	input := []string{"A=1"}
