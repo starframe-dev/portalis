@@ -311,3 +311,129 @@ func TestOSC7PercentDecodedAndControlsRejected(t *testing.T) {
 		t.Fatalf("raw OSC 7 newline path accepted: %q", got)
 	}
 }
+
+func TestDSRRepliesUseActualCursorAndSurviveSplitCSI(t *testing.T) {
+	s := NewScreen(6, 10)
+	p := NewParser(s)
+	s.SetCursor(2, 4)
+
+	var replies []string
+	p.SetResponseCallback(func(data []byte) {
+		replies = append(replies, string(data))
+	})
+
+	p.Feed([]byte("["))
+	p.Feed([]byte("6n"))
+	p.Feed([]byte("[5n"))
+
+	want := []string{"[3;5R", "[0n"}
+	if len(replies) != len(want) {
+		t.Fatalf("DSR replies = %#v, want %#v", replies, want)
+	}
+	for i := range want {
+		if replies[i] != want[i] {
+			t.Fatalf("reply %d = %q, want %q", i, replies[i], want[i])
+		}
+	}
+}
+
+func TestDeviceAttributesReplies(t *testing.T) {
+	s := NewScreen(2, 10)
+	p := NewParser(s)
+	var replies []string
+	p.SetResponseCallback(func(data []byte) { replies = append(replies, string(data)) })
+
+	p.Feed([]byte("[c[>c"))
+	want := []string{"[?1;2c", "[>0;1;0c"}
+	if len(replies) != len(want) || replies[0] != want[0] || replies[1] != want[1] {
+		t.Fatalf("DA replies = %#v, want %#v", replies, want)
+	}
+}
+
+func TestBracketedPasteMarkersInOutputDoNotEnterPasteState(t *testing.T) {
+	s := NewScreen(2, 20)
+	p := NewParser(s)
+	p.Feed([]byte("[200~é[201~X"))
+	if got := s.LineText(0); got != "éX" {
+		t.Fatalf("output around bracketed-paste markers = %q, want éX", got)
+	}
+	if p.state != stateNormal {
+		t.Fatalf("parser state = %v, want normal", p.state)
+	}
+}
+
+func TestStringControlsAreIgnoredUntilST(t *testing.T) {
+	tests := []string{"P", "X", "^", "_"}
+	for _, introducer := range tests {
+		t.Run(introducer, func(t *testing.T) {
+			s := NewScreen(1, 30)
+			p := NewParser(s)
+			p.Feed([]byte("before" + introducer + "hidden payload\after"))
+			if got := s.LineText(0); got != "beforeafter" {
+				t.Fatalf("string control leaked payload: %q", got)
+			}
+		})
+	}
+}
+
+func TestED2ClearsWithoutHomingCursor(t *testing.T) {
+	s := NewScreen(4, 10)
+	p := NewParser(s)
+	p.Feed([]byte("[3;5Hhello[2J"))
+	row, col := s.CursorPos()
+	if row != 2 || col != 9 {
+		t.Fatalf("cursor after ED2 = %d,%d, want 2,9", row, col)
+	}
+	if got := strings.TrimSpace(s.RenderLine(2)); got != "" {
+		t.Fatalf("screen not cleared by ED2: %q", got)
+	}
+}
+
+func TestOriginModeMakesCUPRelativeToScrollRegion(t *testing.T) {
+	s := NewScreen(6, 10)
+	p := NewParser(s)
+	p.Feed([]byte("[2;5r[?6h[1;1H"))
+	if row, col := s.CursorPos(); row != 1 || col != 0 {
+		t.Fatalf("origin-mode CUP = %d,%d, want 1,0", row, col)
+	}
+	p.Feed([]byte("[?6l"))
+	if row, col := s.CursorPos(); row != 0 || col != 0 {
+		t.Fatalf("DECOM reset cursor = %d,%d, want 0,0", row, col)
+	}
+}
+
+func TestAutoWrapModeCanBeDisabled(t *testing.T) {
+	s := NewScreen(1, 3)
+	p := NewParser(s)
+	p.Feed([]byte("[?7lABCD"))
+	if got := s.RenderLine(0); got != "ABD" {
+		t.Fatalf("DECAWM-off line = %q, want ABD", got)
+	}
+	if s.wrapPending {
+		t.Fatal("wrapPending set while DECAWM disabled")
+	}
+}
+
+func TestREPRepeatsPreviousGraphicCharacter(t *testing.T) {
+	s := NewScreen(1, 10)
+	p := NewParser(s)
+	p.Feed([]byte("A[3b"))
+	if got := s.LineText(0); got != "AAAA" {
+		t.Fatalf("REP result = %q, want AAAA", got)
+	}
+}
+
+func TestDECSCRestoresRenditionAndCharset(t *testing.T) {
+	s := NewScreen(2, 10)
+	p := NewParser(s)
+	p.Feed([]byte("[31m(07"))
+	p.Feed([]byte("[0m(B[2;5H"))
+	p.Feed([]byte("8q"))
+
+	if got := s.Cells[0][0].Rune; got != '─' {
+		t.Fatalf("restored DEC charset rendered %q, want line drawing", got)
+	}
+	if got := s.Cells[0][0].FG; got != lipgloss.Color("#800000") {
+		t.Fatalf("restored SGR fg = %q, want dark red", got)
+	}
+}
