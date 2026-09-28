@@ -1,11 +1,11 @@
 package portalis
 
 import (
+	"bytes"
 	"context"
 	"errors"
-	"io"
-	"bytes"
 	"fmt"
+	"io"
 	"image"
 	"image/png"
 	"os"
