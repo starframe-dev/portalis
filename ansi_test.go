@@ -368,7 +368,9 @@ func TestStringControlsAreIgnoredUntilST(t *testing.T) {
 		t.Run(introducer, func(t *testing.T) {
 			s := NewScreen(1, 30)
 			p := NewParser(s)
-			p.Feed([]byte("before" + introducer + "hidden payload\after"))
+			payload := append([]byte("before\x1b"+introducer+"hidden payload\x1b"), '\\')
+			payload = append(payload, []byte("after")...)
+			p.Feed(payload)
 			if got := s.LineText(0); got != "beforeafter" {
 				t.Fatalf("string control leaked payload: %q", got)
 			}
