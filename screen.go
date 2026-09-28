@@ -46,11 +46,18 @@ type Screen struct {
 	Cells  [][]Cell
 	Cursor Cursor
 
-	savedCursor             Cursor
+	savedCursor             Cursor // DECSC/DECRC state
 	savedCells              [][]Cell
+	altSavedCursor          Cursor
+	altSavedScrollTop       int
+	altSavedScrollBottom    int
+	altSavedOriginMode      bool
+	altSavedWrapPending     bool
 	altScreen               bool
 	scrollTop, scrollBottom int  // 0-indexed, DECSTBM. Default 0, Rows-1.
 	wrapPending             bool // true after writing to last column; next char wraps.
+	originMode              bool
+	autoWrap                bool
 
 	scrollback      [][]Cell // lines scrolled off the top
 	scrollbackLimit int
@@ -66,6 +73,7 @@ type Screen struct {
 	mouseMode1002      bool
 	mouseMode1003      bool
 	mouseSGR           bool
+	focusReporting     bool
 	CursorVisible      bool
 	CursorBlinkVisible bool // toggled by emulator for blinking cursor
 
@@ -279,6 +287,7 @@ func NewScreen(rows, cols int) *Screen {
 		scrollBottom:    rows - 1,
 		scrollbackLimit: defaultScrollbackLimit,
 		CursorVisible:   true,
+		autoWrap:        true,
 		renderDirty:     true,
 	}
 	s.resize(rows, cols)
@@ -419,12 +428,30 @@ func (s *Screen) Resize(rows, cols int) {
 }
 
 // Clear clears the entire screen.
+func (s *Screen) blankCell() Cell {
+	return Cell{BG: s.Cursor.BG}
+}
+
+func (s *Screen) fillBlank(cells []Cell, start, end int) {
+	if start < 0 {
+		start = 0
+	}
+	if end > len(cells) {
+		end = len(cells)
+	}
+	if start >= end {
+		return
+	}
+	blank := s.blankCell()
+	for i := start; i < end; i++ {
+		cells[i] = blank
+	}
+}
+
 func (s *Screen) Clear() {
 	s.markDirty()
 	for r := range s.Cells {
-		for c := range s.Cells[r] {
-			s.Cells[r][c] = Cell{}
-		}
+		s.fillBlank(s.Cells[r], 0, len(s.Cells[r]))
 	}
 	s.wrapPending = false
 }
@@ -476,7 +503,7 @@ func (s *Screen) clearCellRange(row, start, end int) {
 	if end < len(cells) && cells[end].Continuation {
 		end++
 	}
-	clear(cells[start:end])
+	s.fillBlank(cells, start, end)
 }
 
 func (s *Screen) clearCellFootprint(row, col int) {
@@ -484,17 +511,18 @@ func (s *Screen) clearCellFootprint(row, col int) {
 		return
 	}
 	cells := s.Cells[row]
+	blank := s.blankCell()
 	if cells[col].Continuation {
-		cells[col] = Cell{}
+		cells[col] = blank
 		if col > 0 {
-			cells[col-1] = Cell{}
+			cells[col-1] = blank
 		}
 		return
 	}
 	if col+1 < len(cells) && cells[col+1].Continuation {
-		cells[col+1] = Cell{}
+		cells[col+1] = blank
 	}
-	cells[col] = Cell{}
+	cells[col] = blank
 }
 
 func (s *Screen) sanitizeWideRow(row int) {
@@ -694,10 +722,18 @@ func (s *Screen) Put(r rune) {
 		width = 1
 	}
 
-	if s.wrapPending || (width == 2 && s.Cursor.Col == s.Cols-1) {
+	if s.autoWrap && (s.wrapPending || (width == 2 && s.Cursor.Col == s.Cols-1)) {
 		s.wrapPending = false
 		s.Cursor.Col = 0
 		s.Index()
+	} else if !s.autoWrap {
+		s.wrapPending = false
+		if width == 2 && s.Cursor.Col == s.Cols-1 {
+			// A double-width rune cannot fit in the final cell with autowrap
+			// disabled. Render a replacement character in-place instead.
+			r = '�'
+			width = 1
+		}
 	}
 
 	// After wrap handling, try to append to previous cluster.
@@ -730,7 +766,7 @@ func (s *Screen) Put(r rune) {
 	nextCol := col + width
 	if nextCol >= s.Cols {
 		s.Cursor.Col = s.Cols - 1
-		s.wrapPending = true
+		s.wrapPending = s.autoWrap
 		return
 	}
 	s.Cursor.Col = nextCol
@@ -753,13 +789,15 @@ func (s *Screen) PutBytes(data []byte) int {
 	}
 	s.markDirty()
 
-	if s.wrapPending {
+	if s.wrapPending && s.autoWrap {
 		s.wrapPending = false
 		s.Cursor.Col = 0
 		s.Index()
 		if s.Cursor.Row < 0 || s.Cursor.Row >= s.Rows {
 			return 0
 		}
+	} else if !s.autoWrap {
+		s.wrapPending = false
 	}
 
 	col := s.Cursor.Col
@@ -767,10 +805,11 @@ func (s *Screen) PutBytes(data []byte) int {
 		return 0
 	}
 
-	// Cap the run at the row boundary, mirroring Put's wrap behavior.
+	// Cap the run at the row boundary when autowrap is enabled. With
+	// DECAWM disabled, bytes beyond the right edge overwrite the last cell.
 	remaining := s.Cols - col
 	n := len(data)
-	if n > remaining {
+	if s.autoWrap && n > remaining {
 		n = remaining
 	}
 
@@ -788,6 +827,20 @@ func (s *Screen) PutBytes(data []byte) int {
 
 	// Fill cells directly without allocating a temporary slice.
 	fg, bg, style := s.Cursor.FG, s.Cursor.BG, s.Cursor.Style
+	if !s.autoWrap {
+		for k := 0; k < n; k++ {
+			target := col + k
+			if target >= s.Cols {
+				target = s.Cols - 1
+			}
+			cells[target] = Cell{Rune: rune(data[k]), FG: fg, BG: bg, Style: style}
+		}
+		s.Cursor.Col = col + n
+		if s.Cursor.Col >= s.Cols {
+			s.Cursor.Col = s.Cols - 1
+		}
+		return n
+	}
 	for k := 0; k < n; k++ {
 		cells[col+k] = Cell{Rune: rune(data[k]), FG: fg, BG: bg, Style: style}
 	}
@@ -817,19 +870,59 @@ func (s *Screen) SetCursor(row, col int) {
 	if col >= s.Cols {
 		col = s.Cols - 1
 	}
+	s.Cursor = s.savedCursor
 	s.Cursor.Row = row
 	s.Cursor.Col = col
 	s.wrapPending = false
 }
 
+// SetCursorAddress applies CUP/HVP/VPA coordinates. In DECOM origin mode the
+// row is relative to the active scrolling region.
+func (s *Screen) SetCursorAddress(row, col int) {
+	if s.originMode {
+		row += s.scrollTop
+		if row < s.scrollTop {
+			row = s.scrollTop
+		}
+		if row > s.scrollBottom {
+			row = s.scrollBottom
+		}
+	}
+	s.SetCursor(row, col)
+}
+
+func (s *Screen) SetOriginMode(active bool) {
+	s.originMode = active
+	if active {
+		s.SetCursor(s.scrollTop, 0)
+	} else {
+		s.SetCursor(0, 0)
+	}
+}
+
+func (s *Screen) SetAutoWrap(active bool) {
+	s.autoWrap = active
+	if !active {
+		s.wrapPending = false
+	}
+}
+
 // CursorUp moves the cursor up n rows.
 func (s *Screen) CursorUp(n int) {
-	s.SetCursor(s.Cursor.Row-n, s.Cursor.Col)
+	row := s.Cursor.Row - n
+	if s.originMode && row < s.scrollTop {
+		row = s.scrollTop
+	}
+	s.SetCursor(row, s.Cursor.Col)
 }
 
 // CursorDown moves the cursor down n rows.
 func (s *Screen) CursorDown(n int) {
-	s.SetCursor(s.Cursor.Row+n, s.Cursor.Col)
+	row := s.Cursor.Row + n
+	if s.originMode && row > s.scrollBottom {
+		row = s.scrollBottom
+	}
+	s.SetCursor(row, s.Cursor.Col)
 }
 
 // CursorForward moves the cursor right n columns.
@@ -844,12 +937,20 @@ func (s *Screen) CursorBackward(n int) {
 
 // CursorNextLine moves the cursor down n rows and to column 0.
 func (s *Screen) CursorNextLine(n int) {
-	s.SetCursor(s.Cursor.Row+n, 0)
+	row := s.Cursor.Row + n
+	if s.originMode && row > s.scrollBottom {
+		row = s.scrollBottom
+	}
+	s.SetCursor(row, 0)
 }
 
 // CursorPrevLine moves the cursor up n rows and to column 0.
 func (s *Screen) CursorPrevLine(n int) {
-	s.SetCursor(s.Cursor.Row-n, 0)
+	row := s.Cursor.Row - n
+	if s.originMode && row < s.scrollTop {
+		row = s.scrollTop
+	}
+	s.SetCursor(row, 0)
 }
 
 // ScrollUp scrolls the active region up by one line.
@@ -890,7 +991,7 @@ func (s *Screen) scrollLineUp() {
 	for r := top + 1; r <= bottom; r++ {
 		copy(s.Cells[r-1], s.Cells[r])
 	}
-	clear(s.Cells[bottom])
+	s.fillBlank(s.Cells[bottom], 0, s.Cols)
 }
 
 // Index moves the cursor down, scrolling the active region at its bottom.
@@ -941,7 +1042,7 @@ func (s *Screen) ScrollRegionDown(n int) {
 		copy(s.Cells[r], s.Cells[r-n])
 	}
 	for r := s.scrollTop; r < s.scrollTop+n; r++ {
-		clear(s.Cells[r])
+		s.fillBlank(s.Cells[r], 0, s.Cols)
 	}
 	if s.selectionActive {
 		s.selectionActive = false
@@ -955,7 +1056,7 @@ func (s *Screen) InsertChars(n int) {
 	n = normalizedCount(n, s.Cols-s.Cursor.Col)
 	row := s.Cells[s.Cursor.Row]
 	copy(row[s.Cursor.Col+n:], row[s.Cursor.Col:s.Cols-n])
-	clear(row[s.Cursor.Col : s.Cursor.Col+n])
+	s.fillBlank(row, s.Cursor.Col, s.Cursor.Col+n)
 	s.sanitizeWideRow(s.Cursor.Row)
 	s.wrapPending = false
 }
@@ -966,7 +1067,7 @@ func (s *Screen) DeleteChars(n int) {
 	n = normalizedCount(n, s.Cols-s.Cursor.Col)
 	row := s.Cells[s.Cursor.Row]
 	copy(row[s.Cursor.Col:], row[s.Cursor.Col+n:])
-	clear(row[s.Cols-n:])
+	s.fillBlank(row, s.Cols-n, s.Cols)
 	s.sanitizeWideRow(s.Cursor.Row)
 	s.wrapPending = false
 }
@@ -990,7 +1091,7 @@ func (s *Screen) InsertLines(n int) {
 		copy(s.Cells[r], s.Cells[r-n])
 	}
 	for r := s.Cursor.Row; r < s.Cursor.Row+n; r++ {
-		clear(s.Cells[r])
+		s.fillBlank(s.Cells[r], 0, s.Cols)
 	}
 	s.wrapPending = false
 }
@@ -1006,7 +1107,7 @@ func (s *Screen) DeleteLines(n int) {
 		copy(s.Cells[r], s.Cells[r+n])
 	}
 	for r := s.scrollBottom - n + 1; r <= s.scrollBottom; r++ {
-		clear(s.Cells[r])
+		s.fillBlank(s.Cells[r], 0, s.Cols)
 	}
 	s.wrapPending = false
 }
@@ -1024,10 +1125,6 @@ func normalizedCount(n, maximum int) int {
 // SaveCursor saves the current cursor position.
 func (s *Screen) SaveCursor() {
 	s.savedCursor = s.Cursor
-	// Don't save FG/BG — just position
-	s.savedCursor.FG = ""
-	s.savedCursor.BG = ""
-	s.savedCursor.Style = 0
 }
 
 // RestoreCursor restores the saved cursor position.
@@ -1059,9 +1156,17 @@ func (s *Screen) EnterAltScreen() {
 	}
 	s.markDirty()
 	s.savedCells = resizeCellGrid(s.Cells, s.Rows, s.Cols)
-	s.savedCursor = s.Cursor
+	s.altSavedCursor = s.Cursor
+	s.altSavedScrollTop = s.scrollTop
+	s.altSavedScrollBottom = s.scrollBottom
+	s.altSavedOriginMode = s.originMode
+	s.altSavedWrapPending = s.wrapPending
 	s.altScreen = true
 	s.viewOffset = 0
+	s.selectionActive = false
+	s.scrollTop = 0
+	s.scrollBottom = s.Rows - 1
+	s.originMode = false
 	s.Clear()
 	s.SetCursor(0, 0)
 }
@@ -1075,8 +1180,8 @@ func (s *Screen) ExitAltScreen() {
 	s.Cells = s.savedCells
 	s.savedCells = nil
 	s.altScreen = false
-	row := s.savedCursor.Row
-	col := s.savedCursor.Col
+	row := s.altSavedCursor.Row
+	col := s.altSavedCursor.Col
 	if row < 0 {
 		row = 0
 	}
@@ -1089,9 +1194,19 @@ func (s *Screen) ExitAltScreen() {
 	if col >= s.Cols {
 		col = s.Cols - 1
 	}
+	s.Cursor = s.altSavedCursor
 	s.Cursor.Row = row
 	s.Cursor.Col = col
-	s.wrapPending = false
+	s.scrollTop = s.altSavedScrollTop
+	s.scrollBottom = s.altSavedScrollBottom
+	if s.scrollTop < 0 || s.scrollTop >= s.Rows {
+		s.scrollTop = 0
+	}
+	if s.scrollBottom < s.scrollTop || s.scrollBottom >= s.Rows {
+		s.scrollBottom = s.Rows - 1
+	}
+	s.originMode = s.altSavedOriginMode
+	s.wrapPending = s.altSavedWrapPending
 }
 
 // SetScrollRegion sets the scrolling region (DECSTBM).
@@ -1109,7 +1224,11 @@ func (s *Screen) SetScrollRegion(top, bottom int) {
 	}
 	s.scrollTop = top - 1
 	s.scrollBottom = bottom - 1
-	s.SetCursor(0, 0)
+	if s.originMode {
+		s.SetCursor(s.scrollTop, 0)
+	} else {
+		s.SetCursor(0, 0)
+	}
 }
 
 // ScrollTop returns the top of the scroll region (0-indexed).
@@ -1161,6 +1280,24 @@ func (s *Screen) LineText(row int) string {
 		b.WriteString(cell.Combining)
 	}
 	return strings.TrimRight(b.String(), " ")
+}
+
+func (s *Screen) ClearToCursor() {
+	s.markDirty()
+	for r := 0; r < s.Cursor.Row; r++ {
+		s.fillBlank(s.Cells[r], 0, s.Cols)
+	}
+	s.clearCellRange(s.Cursor.Row, 0, s.Cursor.Col+1)
+}
+
+func (s *Screen) ClearScrollback() {
+	if len(s.scrollback) == 0 {
+		return
+	}
+	s.markDirty()
+	s.scrollback = nil
+	s.viewOffset = 0
+	s.selectionActive = false
 }
 
 // ScrollViewUp moves the view up into the scrollback by n lines.
