@@ -3,11 +3,13 @@ package portalis
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"fmt"
 	"io"
 	"os"
 	"os/exec"
 	"syscall"
+	"sync"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/creack/pty"
@@ -28,6 +30,9 @@ type Pty struct {
 	Output         chan []byte
 	Errors         chan error
 	done           chan struct{}
+	closeOnce      sync.Once
+	mu             sync.Mutex
+	closeErr       error
 
 	lastRows int
 	lastCols int
@@ -76,6 +81,8 @@ func SpawnInDir(command string, args []string, dir string, env ...string) (*Pty,
 
 // Write sends data to the PTY.
 func (p *Pty) Write(data []byte) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.ptmx == nil {
 		return fmt.Errorf("pty closed")
 	}
@@ -85,6 +92,11 @@ func (p *Pty) Write(data []byte) error {
 
 // Resize resizes the PTY and signals the child process about the change.
 func (p *Pty) Resize(rows, cols int) error {
+	if rows <= 0 || cols <= 0 || rows > 65535 || cols > 65535 {
+		return fmt.Errorf("invalid pty size %dx%d", rows, cols)
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	if p.ptmx == nil {
 		return fmt.Errorf("pty closed")
 	}
@@ -109,15 +121,35 @@ func (p *Pty) Resize(rows, cols int) error {
 
 // Close closes the PTY and kills the process.
 func (p *Pty) Close() error {
-	close(p.done)
-	if p.ptmx != nil {
-		p.ptmx.Close()
-	}
-	if p.cmd != nil && p.cmd.Process != nil {
-		p.cmd.Process.Kill()
-		p.cmd.Process.Wait()
-	}
-	return nil
+	p.closeOnce.Do(func() {
+		if p.done != nil {
+			close(p.done)
+		}
+
+		p.mu.Lock()
+		ptmx := p.ptmx
+		p.ptmx = nil
+		cmd := p.cmd
+		p.mu.Unlock()
+
+		if ptmx != nil {
+			if err := ptmx.Close(); err != nil && p.closeErr == nil {
+				p.closeErr = err
+			}
+		}
+		if cmd != nil && cmd.Process != nil {
+			if err := cmd.Process.Kill(); err != nil && !errors.Is(err, os.ErrProcessDone) && p.closeErr == nil {
+				p.closeErr = err
+			}
+			if _, err := cmd.Process.Wait(); err != nil {
+				var exitErr *exec.ExitError
+				if !errors.As(err, &exitErr) && !errors.Is(err, os.ErrProcessDone) && p.closeErr == nil {
+					p.closeErr = err
+				}
+			}
+		}
+	})
+	return p.closeErr
 }
 
 func (p *Pty) readLoop() {
@@ -148,10 +180,10 @@ func (p *Pty) readLoop() {
 			}
 
 			if bytes.Contains(data, []byte("\x1b[6n")) {
-				p.ptmx.Write([]byte("\x1b[1;1R"))
+				_ = p.Write([]byte("\x1b[1;1R"))
 			}
 			if bytes.Contains(data, []byte("\x1b[5n")) {
-				p.ptmx.Write([]byte("\x1b[0n"))
+				_ = p.Write([]byte("\x1b[0n"))
 			}
 
 			select {
@@ -174,14 +206,16 @@ func (p *Pty) readLoop() {
 
 // PtyOutputMsg is sent when new data arrives from the PTY.
 type PtyOutputMsg struct {
-	SessionID string
-	Data      []byte
+	SessionID  string
+	Generation uint64
+	Data       []byte
 }
 
 // PtyExitMsg is sent when the PTY process exits.
 type PtyExitMsg struct {
-	SessionID string
-	Err       error
+	SessionID  string
+	Generation uint64
+	Err        error
 }
 
 // SendBytes sends raw bytes to the PTY.
@@ -200,9 +234,15 @@ func SendBytes(p *Pty, data []byte) tea.Cmd {
 func (p *Pty) Listen(sessionID string) tea.Cmd {
 	return func() tea.Msg {
 		select {
-		case data := <-p.Output:
+		case data, ok := <-p.Output:
+			if !ok {
+				return PtyExitMsg{SessionID: sessionID}
+			}
 			return PtyOutputMsg{SessionID: sessionID, Data: data}
-		case err := <-p.Errors:
+		case err, ok := <-p.Errors:
+			if !ok {
+				return PtyExitMsg{SessionID: sessionID}
+			}
 			return PtyExitMsg{SessionID: sessionID, Err: err}
 		}
 	}
