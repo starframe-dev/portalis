@@ -38,6 +38,9 @@ jobs:
         run: go test ./...
       - name: Race detector
         run: go test -race ./...
+      - name: Fuzz parser smoke test
+        if: runner.os == 'Linux'
+        run: go test -run=^$ -fuzz=FuzzParserFeed -fuzztime=5s .
 
   vulnerability-scan:
     runs-on: ubuntu-latest
