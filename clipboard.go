@@ -1,6 +1,9 @@
 package portalis
 
 import (
+	"context"
+	"errors"
+	"io"
 	"bytes"
 	"fmt"
 	"image"
@@ -9,9 +12,48 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 )
+
+const (
+	maxClipboardBytes       = 100 << 20
+	maxClipboardImagePixels = 100_000_000
+	clipboardCommandTimeout = 5 * time.Second
+)
+
+func commandOutputLimited(stdin string, name string, args ...string) ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), clipboardCommandTimeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, name, args...)
+	if stdin != "" {
+		cmd.Stdin = strings.NewReader(stdin)
+	}
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		return nil, err
+	}
+	if err := cmd.Start(); err != nil {
+		return nil, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(stdout, int64(maxClipboardBytes)+1))
+	waitErr := cmd.Wait()
+	if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		return nil, fmt.Errorf("%s timed out", name)
+	}
+	if len(data) > maxClipboardBytes {
+		return nil, fmt.Errorf("%s output exceeds %d bytes", name, maxClipboardBytes)
+	}
+	if readErr != nil {
+		return nil, readErr
+	}
+	if waitErr != nil {
+		return nil, waitErr
+	}
+	return data, nil
+}
 
 // copyToClipboard sends the given lines (newline-joined) to the system clipboard.
 func copyToClipboard(lines []string) error {
@@ -29,9 +71,12 @@ func copyToClipboard(lines []string) error {
 	var lastErr error
 	for _, cmd := range candidates {
 		if _, err := exec.LookPath(cmd[0]); err == nil {
-			c := exec.Command(cmd[0], cmd[1:]...)
+			ctx, cancel := context.WithTimeout(context.Background(), clipboardCommandTimeout)
+			c := exec.CommandContext(ctx, cmd[0], cmd[1:]...)
 			c.Stdin = strings.NewReader(text)
-			if err := c.Run(); err == nil {
+			err := c.Run()
+			cancel()
+			if err == nil {
 				return nil
 			} else {
 				lastErr = err
@@ -104,16 +149,15 @@ func pasteMac() (string, string, error) {
 	if path, err := pasteMacImage(); err == nil && path != "" {
 		// Confirm it actually exists and is non-empty.
 		if info, statErr := os.Stat(path); statErr == nil && info.Size() > 0 {
-			const maxClipboardImageBytes = 100 << 20
-			if info.Size() > maxClipboardImageBytes {
+			if info.Size() > maxClipboardBytes {
 				_ = os.Remove(path)
-				return "", "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardImageBytes)
+				return "", "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardBytes)
 			}
 			_ = os.Chmod(path, 0o600)
 			return "", path, nil
 		}
 	}
-	out, err := exec.Command("pbpaste").Output()
+	out, err := commandOutputLimited("", "pbpaste")
 	if err != nil {
 		return "", "", err
 	}
@@ -134,9 +178,7 @@ func pasteMacImage() (string, error) {
 	if _, err := exec.LookPath("swift"); err != nil {
 		return "", err
 	}
-	cmd := exec.Command("swift", "-")
-	cmd.Stdin = strings.NewReader(clipboardImageSwift)
-	out, err := cmd.Output()
+	out, err := commandOutputLimited(clipboardImageSwift, "swift", "-")
 	if err != nil {
 		return "", err
 	}
@@ -153,7 +195,7 @@ func pasteMacImage() (string, error) {
 // pasteWayland uses wl-paste. Image transfer requires --type image/png.
 func pasteWayland() (string, string, error) {
 	// Try text first.
-	if out, err := exec.Command("wl-paste", "--no-newline").Output(); err == nil {
+	if out, err := commandOutputLimited("", "wl-paste", "--no-newline"); err == nil {
 		// Could be text or PNG bytes — check signature.
 		if len(out) >= 8 && bytes.HasPrefix(out, []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}) {
 			path, err := saveImageBytes(out)
@@ -162,7 +204,7 @@ func pasteWayland() (string, string, error) {
 		return string(out), "", nil
 	}
 	// Try image.
-	out, err := exec.Command("wl-paste", "--type", "image/png").Output()
+	out, err := commandOutputLimited("", "wl-paste", "--type", "image/png")
 	if err != nil {
 		return "", "", err
 	}
@@ -172,12 +214,12 @@ func pasteWayland() (string, string, error) {
 
 // pasteX11 uses xclip -selection clipboard -o.
 func pasteX11() (string, string, error) {
-	out, err := exec.Command("xclip", "-selection", "clipboard", "-o", "-t", "image/png").Output()
+	out, err := commandOutputLimited("", "xclip", "-selection", "clipboard", "-o", "-t", "image/png")
 	if err == nil && len(out) > 0 {
 		path, err := saveImageBytes(out)
 		return "", path, err
 	}
-	out, err = exec.Command("xclip", "-selection", "clipboard", "-o").Output()
+	out, err = commandOutputLimited("", "xclip", "-selection", "clipboard", "-o")
 	if err != nil {
 		return "", "", err
 	}
@@ -185,10 +227,8 @@ func pasteX11() (string, string, error) {
 }
 
 func saveImageBytes(data []byte) (string, error) {
-	const maxClipboardImageBytes = 100 << 20
-	const maxClipboardImagePixels = 100_000_000
-	if len(data) > maxClipboardImageBytes {
-		return "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardImageBytes)
+	if len(data) > maxClipboardBytes {
+		return "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardBytes)
 	}
 	config, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
@@ -253,6 +293,16 @@ func (e *Emulator) PasteFromClipboard() tea.Cmd {
 			return nil
 		}
 
+		e.mu.RLock()
+		current := e.pty == pty && e.listenerGeneration == generation
+		e.mu.RUnlock()
+		if !current {
+			if imagePath != "" {
+				_ = os.Remove(imagePath)
+			}
+			return nil
+		}
+
 		var payload []byte
 		if imagePath != "" {
 			payload = []byte(imagePath + "\n")
@@ -263,7 +313,19 @@ func (e *Emulator) PasteFromClipboard() tea.Cmd {
 			payload = []byte(text)
 		}
 		if err := pty.Write(payload); err != nil {
+			if imagePath != "" {
+				_ = os.Remove(imagePath)
+			}
 			return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
+		}
+		if imagePath != "" {
+			e.mu.Lock()
+			if e.pty == pty && e.listenerGeneration == generation {
+				e.tempFiles = append(e.tempFiles, imagePath)
+			} else {
+				_ = os.Remove(imagePath)
+			}
+			e.mu.Unlock()
 		}
 		return nil
 	}
