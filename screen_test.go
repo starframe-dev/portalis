@@ -1083,7 +1083,6 @@ func TestParserSpinnerWithWideChars(t *testing.T) {
 	}
 }
 
-
 func TestAltScreenResizePreservesPrimaryDimensions(t *testing.T) {
 	s := NewScreen(3, 5)
 	for _, r := range "hello" {
