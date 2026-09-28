@@ -118,23 +118,23 @@ func (e *Emulator) Start() tea.Cmd {
 func (e *Emulator) SetStartEnv(env []string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.startEnv = env
+	e.startEnv = append([]string(nil), env...)
 }
 
 // StartEnv returns the env vars recorded via SetStartEnv (nil when unset).
 func (e *Emulator) StartEnv() []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.startEnv
+	return append([]string(nil), e.startEnv...)
 }
 
 // effectiveEnv resolves the env vars to spawn with: explicit extraEnv wins,
 // otherwise the recorded startEnv is used.
 func (e *Emulator) effectiveEnv(extraEnv []string) []string {
 	if extraEnv != nil {
-		return extraEnv
+		return append([]string(nil), extraEnv...)
 	}
-	return e.startEnv
+	return append([]string(nil), e.startEnv...)
 }
 
 // SetScrollbackLimit sets the maximum number of scrollback lines. Non-positive
@@ -251,6 +251,14 @@ func (e *Emulator) Listen() tea.Cmd {
 
 	return func() tea.Msg {
 		msg := pty.Listen(e.SessionID)()
+		switch m := msg.(type) {
+		case PtyOutputMsg:
+			m.Generation = generation
+			msg = m
+		case PtyExitMsg:
+			m.Generation = generation
+			msg = m
+		}
 
 		e.mu.Lock()
 		if e.listenerGeneration == generation {
@@ -331,7 +339,10 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		e.mu.Unlock()
 		return nil
 	case PtyOutputMsg:
-		if msg.SessionID != e.SessionID {
+		e.mu.RLock()
+		currentGeneration := e.listenerGeneration
+		e.mu.RUnlock()
+		if msg.SessionID != e.SessionID || (msg.Generation != 0 && msg.Generation != currentGeneration) {
 			return nil
 		}
 		e.mu.Lock()
@@ -357,8 +368,19 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		// second PTY listener or delay current output.
 		return nil
 	case PtyExitMsg:
-		if msg.SessionID != e.SessionID {
+		e.mu.Lock()
+		if msg.SessionID != e.SessionID || (msg.Generation != 0 && msg.Generation != e.listenerGeneration) {
+			e.mu.Unlock()
 			return nil
+		}
+		pty := e.pty
+		e.pty = nil
+		e.listenerPending = false
+		e.listenerGeneration++
+		e.stopped = true
+		e.mu.Unlock()
+		if pty != nil {
+			_ = pty.Close()
 		}
 		return nil
 	}
@@ -367,7 +389,6 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 
 func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 	e.mu.Lock()
-	defer e.mu.Unlock()
 
 	// Any keystroke returns the view to the live screen.
 	if e.screen != nil {
@@ -375,6 +396,7 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 
 	if e.pty == nil {
+		e.mu.Unlock()
 		return nil
 	}
 	modes := keyEncodingModes{}
@@ -384,6 +406,7 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 	data := keyToBytesWithModes(msg, modes)
 	if len(data) == 0 {
+		e.mu.Unlock()
 		return nil
 	}
 
@@ -397,15 +420,28 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 			if len(e.commandHistory) > maxHistory {
 				e.commandHistory = e.commandHistory[len(e.commandHistory)-maxHistory:]
 			}
-			if e.OnCommandHistoryChanged != nil {
-				e.OnCommandHistoryChanged(e.commandHistory)
-			}
 		}
+	}
+
+	// Copy callback state while locked, but never invoke external code under
+	// the emulator mutex: callbacks may safely call back into Emulator.
+	onHistoryChanged := e.OnCommandHistoryChanged
+	history := append([]string(nil), e.commandHistory...)
+	pty := e.pty
+	generation := e.listenerGeneration
+	e.mu.Unlock()
+
+	if onHistoryChanged != nil && msg.Type == tea.KeyEnter {
+		onHistoryChanged(history)
 	}
 
 	// Write synchronously to preserve keystroke order. Async tea.Cmd
 	// execution can reorder rapid successive key messages.
-	e.pty.Write(data)
+	if err := pty.Write(data); err != nil {
+		return func() tea.Msg {
+			return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
+		}
+	}
 	return nil
 }
 
@@ -640,7 +676,7 @@ func (e *Emulator) CWD() string {
 func (e *Emulator) SetCommandHistory(history []string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	e.commandHistory = history
+	e.commandHistory = append([]string(nil), history...)
 }
 
 func renderAsciiArt(width, height int) string {
@@ -672,7 +708,7 @@ func renderAsciiArt(width, height int) string {
 			pad := startX
 			lineW := lipgloss.Width(line)
 			if pad+lineW > width {
-				line = line[:width-pad]
+				line = truncateToWidth(line, width-pad)
 				lineW = lipgloss.Width(line)
 			}
 			trail := width - pad - lineW
@@ -685,6 +721,21 @@ func renderAsciiArt(width, height int) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+func truncateToWidth(s string, width int) string {
+	if width <= 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, r := range s {
+		candidate := b.String() + string(r)
+		if lipgloss.Width(candidate) > width {
+			break
+		}
+		b.WriteRune(r)
+	}
+	return b.String()
 }
 
 func emptyView(width, height int) string {
