@@ -230,7 +230,6 @@ func TestParserTmuxModesAndFrame(t *testing.T) {
 	}
 }
 
-
 func TestParserInvalidUTF8DoesNotAccumulate(t *testing.T) {
 	s := NewScreen(2, 20)
 	p := NewParser(s)
