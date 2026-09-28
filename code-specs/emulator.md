@@ -279,7 +279,7 @@ func mouseToBytes(msg tea.MouseMsg) []byte
   - Press → запоминаем позицию.
   - Motion > 1 клетка → начинаем drag-выбор.
   - Release → копируем выделенный текст в буфер обмена.
-- Все события (включая Press) форвардятся в PTY, чтобы приложения получали полные кликовые последовательности.
+- События форвардятся в PTY только после DECSET mouse mode (`?1000`, `?1002` или `?1003`). `?1006` включает SGR encoding; без него используется X10. Shift принудительно оставляет событие локальному selection/scrollback.
 
 ### Обработка ресайза
 
@@ -291,3 +291,11 @@ func mouseToBytes(msg tea.MouseMsg) []byte
 
 - `scrollUp(lines)` / `scrollDown(lines)` — скролл вверх/вниз.
 - Колёсо мыши вызывает `scrollUp(3)` / `scrollDown(3)`.
+
+
+## Lifecycle invariants
+
+- \`Start()\`/\`StartWithEnv()\` получают lifecycle generation в момент создания \`tea.Cmd\`; \`Stop()\` и \`Close()\` инвалидируют ещё не выполненные start-команды.
+- \`Close()\`/\`Stop()\` сначала отсоединяют PTY под mutex, затем закрывают процесс уже без mutex.
+- Новый terminal reset очищает старый OSC 7 \`cwd\`; пока новый shell не сообщил путь, \`CWD()\` возвращает \`InitialCWD\`.
+- \`PtyExitMsg\` и старые listener messages не могут завершить или модифицировать новую generation.
