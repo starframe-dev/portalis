@@ -175,6 +175,11 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 
 	pty, err := spawnPtyConfig(command, args, initialCWD, sessionID, env)
 	if err != nil {
+		e.mu.Lock()
+		if lifecycle == e.lifecycleGeneration && generation == e.listenerGeneration {
+			e.stopped = true
+		}
+		e.mu.Unlock()
 		return err
 	}
 
@@ -194,6 +199,7 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 			if e.pty == pty && e.listenerGeneration == generation {
 				e.pty = nil
 				e.listenerGeneration++
+				e.stopped = true
 			}
 			e.mu.Unlock()
 			_ = pty.Close()
@@ -870,7 +876,7 @@ func (e *Emulator) Blur() tea.Cmd {
 }
 
 // Close closes the PTY.
-func (e *Emulator) Close() {
+func (e *Emulator) Close() error {
 	e.mu.Lock()
 	pty := e.pty
 	tempFiles := append([]string(nil), e.tempFiles...)
@@ -880,16 +886,20 @@ func (e *Emulator) Close() {
 	e.listenerGeneration++
 	e.lifecycleGeneration++
 	e.mu.Unlock()
+	var closeErr error
 	if pty != nil {
-		_ = pty.Close()
+		closeErr = pty.Close()
 	}
 	for _, path := range tempFiles {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && closeErr == nil {
+			closeErr = err
+		}
 	}
+	return closeErr
 }
 
 // Stop terminates the session and switches the panel to the idle ASCII art view.
-func (e *Emulator) Stop() {
+func (e *Emulator) Stop() error {
 	e.mu.Lock()
 	pty := e.pty
 	tempFiles := append([]string(nil), e.tempFiles...)
@@ -900,12 +910,16 @@ func (e *Emulator) Stop() {
 	e.lifecycleGeneration++
 	e.stopped = true
 	e.mu.Unlock()
+	var closeErr error
 	if pty != nil {
-		_ = pty.Close()
+		closeErr = pty.Close()
 	}
 	for _, path := range tempFiles {
-		_ = os.Remove(path)
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && closeErr == nil {
+			closeErr = err
+		}
 	}
+	return closeErr
 }
 
 // SetInitialCWD sets the directory in which the PTY process starts.
