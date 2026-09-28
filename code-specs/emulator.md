@@ -299,3 +299,20 @@ func mouseToBytes(msg tea.MouseMsg) []byte
 - \`Close()\`/\`Stop()\` сначала отсоединяют PTY под mutex, затем закрывают процесс уже без mutex.
 - Новый terminal reset очищает старый OSC 7 \`cwd\`; пока новый shell не сообщил путь, \`CWD()\` возвращает \`InitialCWD\`.
 - \`PtyExitMsg\` и старые listener messages не могут завершить или модифицировать новую generation.
+
+
+## Current lifecycle and reply semantics
+
+- PTY process creation runs **outside** \`Emulator.mu\`. A lifecycle token is
+  captured before spawn; \`Stop\`/\`Close\` can cancel an in-flight start.
+- \`PtyReadyMsg\`, \`PtyOutputMsg\` and \`PtyExitMsg\` carry an exact generation;
+  generation zero is not a wildcard.
+- Parser-generated DSR/DA replies are queued while parsing and written after
+  releasing \`Emulator.mu\`.
+- \`OnError func(error)\` receives PTY/clipboard message errors.
+- \`Focus()\` and \`Blur()\` return \`tea.Cmd\`; when child enabled \`?1004\`
+  they send \`CSI I\` / \`CSI O\`. \`Update\` also accepts Bubble Tea
+  \`FocusMsg\`/\`BlurMsg\`.
+- \`Close()\` and \`Stop()\` return lifecycle cleanup errors and remove tracked
+  clipboard temp files.
+- Constructor arguments, environment and restored history are defensive copies.
