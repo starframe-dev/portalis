@@ -179,7 +179,7 @@ func TestStalePtyOutputGenerationIsIgnored(t *testing.T) {
 	current := em.listenerGeneration
 	em.mu.Unlock()
 
-	em.Update(PtyOutputMsg{SessionID: "session", Generation: current - 1, Data: []byte("stale")})
+	em.Update(PtyOutputMsg{SessionID: "session", Generation: current + 1, Data: []byte("stale")})
 	if got := em.screen.RenderLine(0); got[:5] == "stale" {
 		t.Fatalf("stale PTY generation was rendered: %q", got)
 	}
