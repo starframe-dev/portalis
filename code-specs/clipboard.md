@@ -285,3 +285,18 @@ macOS `pbpaste` возвращает только текстовое предс�
 - Decoded image dimensions: максимум 100 000 000 пикселей.
 - Swift reader на macOS проверяет размер данных до записи temp-файла.
 - Имена PNG создаются атомарно через \`os.CreateTemp\`; предсказуемых timestamp-имён нет.
+
+
+## Subprocess bounds and cleanup
+
+- External clipboard readers run with a 5-second context timeout.
+- stdout is read through \`io.LimitReader\` and capped at 100 MiB before an
+  unbounded allocation can occur; oversized commands are cancelled promptly.
+- Paste captures PTY generation before starting the OS clipboard operation and
+  revalidates the exact PTY/generation before writing. A delayed paste can
+  never land in a restarted session.
+- Image paths successfully handed to the child are tracked by Emulator and
+  removed by \`Close\`/\`Stop\`; stale/failed pastes delete their temp file
+  immediately.
+- Clipboard failures are surfaced as \`ClipboardErrorMsg\` and can reach the
+  host through \`Emulator.OnError\`.
