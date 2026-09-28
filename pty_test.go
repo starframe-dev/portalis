@@ -3,8 +3,10 @@ package portalis
 import (
 	"bufio"
 	"bytes"
+	"errors"
 	"os"
 	"testing"
+	"time"
 
 	creackpty "github.com/creack/pty"
 )
@@ -133,5 +135,78 @@ func TestPtyListenHandlesClosedErrorChannel(t *testing.T) {
 	}
 	if exit.SessionID != "session" {
 		t.Fatalf("session = %q, want session", exit.SessionID)
+	}
+}
+
+
+func TestPtyListenDrainsBufferedOutputBeforeExit(t *testing.T) {
+	p := &Pty{
+		Output:   make(chan []byte, 2),
+		Errors:   make(chan error, 1),
+		readDone: make(chan struct{}),
+	}
+	p.Output <- []byte("final")
+	p.terminalErr = errors.New("terminal closed")
+	close(p.readDone)
+
+	msg := p.Listen("session")()
+	out, ok := msg.(PtyOutputMsg)
+	if !ok || string(out.Data) != "final" {
+		t.Fatalf("first message = %#v, want final PtyOutputMsg", msg)
+	}
+
+	msg = p.Listen("session")()
+	exit, ok := msg.(PtyExitMsg)
+	if !ok {
+		t.Fatalf("second message type = %T, want PtyExitMsg", msg)
+	}
+	if exit.Err == nil || exit.Err.Error() != "terminal closed" {
+		t.Fatalf("exit error = %v, want terminal closed", exit.Err)
+	}
+}
+
+func TestPtyWriteDoesNotHoldLifecycleMutexWhileBlocked(t *testing.T) {
+	r, w, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer r.Close()
+	p := &Pty{ptmx: w, done: make(chan struct{})}
+
+	writeDone := make(chan struct{})
+	go func() {
+		_ = p.Write(bytes.Repeat([]byte("x"), 8<<20))
+		close(writeDone)
+	}()
+
+	// Give the large pipe write time to block with no reader.
+	time.Sleep(50 * time.Millisecond)
+	lockDone := make(chan struct{})
+	go func() {
+		p.mu.Lock()
+		p.mu.Unlock()
+		close(lockDone)
+	}()
+
+	select {
+	case <-lockDone:
+	case <-time.After(time.Second):
+		t.Fatal("Pty.Write held lifecycle mutex while blocked in I/O")
+	}
+
+	_ = w.Close()
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked write did not unblock after file close")
+	}
+}
+
+func TestSendBytesReturnsWriteError(t *testing.T) {
+	p := &Pty{}
+	msg := SendBytes(p, []byte("x"))()
+	got, ok := msg.(PtyErrorMsg)
+	if !ok || got.Err == nil {
+		t.Fatalf("SendBytes message = %#v, want PtyErrorMsg", msg)
 	}
 }
