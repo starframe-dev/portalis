@@ -272,7 +272,6 @@ func TestParserBoundsUnterminatedCSI(t *testing.T) {
 	}
 }
 
-
 func TestANSI256ColorXtermCube(t *testing.T) {
 	tests := map[int]string{
 		16:  "#000000",
