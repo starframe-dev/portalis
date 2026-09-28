@@ -55,7 +55,7 @@ PTY читает по 4096 байт. Каждый chunk превращается
 
 1. `ansi.go` — корректная обработка ESC/CSI/DEC-последовательностей и режимов tmux.
 2. `screen.go` — операции вставки/удаления символов и строк, reverse index, видимость курсора, application cursor mode, bracketed paste mode, dirty-cache рендера.
-3. `emulator.go` — полный xterm encoder клавиш, передача Ctrl/Alt/F-key, прекращение перехвата `Ctrl+V`, bracketed paste по режиму экрана, объединение очереди PTY-output.
+3. `emulator.go` — полный xterm encoder клавиш, передача Ctrl/Alt/F-key, прекращение перехвата `Ctrl+V`, bracketed paste по режиму экрана и single-flight ordered PTY listener.
 4. `pty.go` — корректный resize без потери последнего размера; единая реализация `Listen` без дублирования.
 5. `ansi_test.go`, `screen_test.go`, `key_test.go`, новый `pty_test.go` — регрессионные сценарии.
 6. `code-specs/ansi.md`, `code-specs/screen.md`, `code-specs/emulator.md`, `code-specs/pty.md`, `specs/portalis.md`, `README.md` — синхронизация документации.
@@ -95,8 +95,8 @@ PTY читает по 4096 байт. Каждый chunk превращается
 ### PTY и поток вывода
 
 1. Удалить некорректный 50-мс resize throttle. `lastRows/lastCols` обновлять только после успешного `pty.Setsize`.
-2. После первого PTY chunk неблокирующе собрать уже ожидающие chunks из `Output` в один `PtyOutputMsg` с ограничением максимального размера одного сообщения.
-3. Использовать одну реализацию listener (`Pty.Listen`), удалить дублирующий `listenPty`.
+2. Каждый PTY read до 4096 байт выдавать отдельным `PtyOutputMsg`; не coalesce'ить reads, чтобы один `Parser.Feed` оставался bounded и responsive.
+3. Использовать одну single-flight реализацию listener (`Pty.Listen`), сохранить строгий порядок chunks и дренировать final output перед exit.
 4. Не добавлять искусственную задержку к первому chunk, чтобы интерактивный ввод оставался отзывчивым.
 
 ## Тесты
@@ -128,7 +128,7 @@ Table-driven тест должен показать исходное Bubble Tea-
 ### Производительность и resize
 
 1. Два быстрых resize применяют последний физический размер PTY.
-2. Listener объединяет заранее накопленные chunks и сохраняет порядок байтов.
+2. Listener сохраняет исходные 4 KiB read boundaries и строгий порядок байтов.
 3. Повторный `Render()` без мутаций возвращает cache; после изменения cache инвалидируется.
 4. Benchmark сравнивает обработку tmux-frame и повторный cached render.
 
@@ -158,8 +158,16 @@ go vet ./...
 - [ ] `Alt+Backspace` отправляет `ESC DEL`.
 - [ ] Модифицированные стрелки и F-клавиши имеют xterm-совместимые последовательности.
 - [ ] Последний resize всегда физически применяется к PTY.
-- [ ] Накопленные PTY chunks объединяются без изменения порядка.
+- [x] PTY chunks применяются строго по порядку, сохраняют bounded read boundaries и дренируются перед exit.
 - [ ] Неизменившийся экран не пересобирается на каждый `View`.
 - [ ] Новые регрессионные и существующие тесты проходят с `-race`.
 - [ ] `go vet ./...` проходит без ошибок.
 - [ ] Per-file спецификации и README соответствуют реализации.
+
+
+## Актуализация после hardening
+
+Документ начинался как план исправлений. Текущая реализация дополнительно имеет
+generation guards, cancellable start lifecycle, DSR/DA parser replies, DECOM/
+DECAWM, BCE, DEC mouse/focus modes, bounded ANSI/OSC/grapheme state и parser
+fuzzing с проверкой chunk-boundary equivalence.
