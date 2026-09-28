@@ -1160,3 +1160,105 @@ func TestScrollbackLimitClampsViewOffset(t *testing.T) {
 		t.Fatalf("viewOffset = %d, want 1 after scrollback shrink", s.viewOffset)
 	}
 }
+
+func TestAltScreenUsesIndependentSavedCursor(t *testing.T) {
+	s := NewScreen(6, 10)
+	s.SetCursor(4, 7)
+	s.EnterAltScreen()
+	s.SetCursor(1, 2)
+	s.SaveCursor()
+	s.SetCursor(3, 5)
+	s.RestoreCursor()
+	if row, col := s.CursorPos(); row != 1 || col != 2 {
+		t.Fatalf("alt DECSC restore = %d,%d, want 1,2", row, col)
+	}
+	s.ExitAltScreen()
+	if row, col := s.CursorPos(); row != 4 || col != 7 {
+		t.Fatalf("main cursor after alt exit = %d,%d, want 4,7", row, col)
+	}
+}
+
+func TestAltScreenRestoresScrollRegionAndModes(t *testing.T) {
+	s := NewScreen(8, 10)
+	s.SetScrollRegion(2, 6)
+	s.SetOriginMode(true)
+	s.SetAutoWrap(false)
+	wantTop, wantBottom := s.scrollTop, s.scrollBottom
+
+	s.EnterAltScreen()
+	s.SetScrollRegion(3, 4)
+	s.SetOriginMode(false)
+	s.SetAutoWrap(true)
+	s.ExitAltScreen()
+
+	if s.scrollTop != wantTop || s.scrollBottom != wantBottom {
+		t.Fatalf("main scroll region = %d-%d, want %d-%d", s.scrollTop, s.scrollBottom, wantTop, wantBottom)
+	}
+	if !s.originMode {
+		t.Fatal("main origin mode was not restored")
+	}
+	if s.autoWrap {
+		t.Fatal("main autowrap mode was not restored")
+	}
+}
+
+func TestBackgroundColorEraseUsesCurrentBackground(t *testing.T) {
+	s := NewScreen(2, 5)
+	s.Cursor.BG = lipgloss.Color("#123456")
+	s.Put('X')
+	s.SetCursor(0, 0)
+	s.ClearLineAll()
+	for col, cell := range s.Cells[0] {
+		if cell.Rune != 0 {
+			t.Fatalf("cleared cell %d still has rune %q", col, cell.Rune)
+		}
+		if cell.BG != lipgloss.Color("#123456") {
+			t.Fatalf("cleared cell %d background = %q, want BCE color", col, cell.BG)
+		}
+	}
+}
+
+func TestResizeScrollbackDropsWideBaseCutAtEdge(t *testing.T) {
+	s := NewScreen(2, 6)
+	line := make([]Cell, 6)
+	line[2] = Cell{Rune: '日'}
+	line[3] = Cell{Continuation: true}
+	s.scrollback = [][]Cell{line}
+
+	s.Resize(2, 3)
+	if got := s.scrollback[0][2]; got.Rune != 0 || got.Continuation {
+		t.Fatalf("wide base survived without continuation at new edge: %+v", got)
+	}
+}
+
+func TestSaveRestoreCursorPreservesRenditionAndModes(t *testing.T) {
+	s := NewScreen(4, 8)
+	s.Cursor.FG = lipgloss.Color("#111111")
+	s.Cursor.BG = lipgloss.Color("#222222")
+	s.Cursor.Style = StyleBold | StyleUnderline
+	s.SetOriginMode(true)
+	s.SetAutoWrap(false)
+	s.SetCursor(2, 3)
+	s.SaveCursor()
+
+	s.Cursor.FG = ""
+	s.Cursor.BG = ""
+	s.Cursor.Style = 0
+	s.SetOriginMode(false)
+	s.SetAutoWrap(true)
+	s.SetCursor(0, 0)
+	s.RestoreCursor()
+
+	if row, col := s.CursorPos(); row != 2 || col != 3 {
+		t.Fatalf("restored cursor = %d,%d, want 2,3", row, col)
+	}
+	if s.Cursor.FG != lipgloss.Color("#111111") || s.Cursor.BG != lipgloss.Color("#222222") {
+		t.Fatalf("restored colors = fg:%q bg:%q", s.Cursor.FG, s.Cursor.BG)
+	}
+	if s.Cursor.Style != StyleBold|StyleUnderline {
+		t.Fatalf("restored style = %v", s.Cursor.Style)
+	}
+	if !s.originMode || s.autoWrap {
+		t.Fatalf("restored modes origin=%v autowrap=%v", s.originMode, s.autoWrap)
+	}
+}
