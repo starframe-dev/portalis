@@ -141,7 +141,7 @@ func extractOSC7Path(s string) string
 Извлекает абсолютный путь файловой системы из OSC 7 payload.
 
 **Поддерживаемые формы:**
-- `file://hostname/path` → `/path`
+- `file://hostname/path` → percent-decoded `/path`
 - `/absolute/path` → `/absolute/path`
 
 **Параметры:**
@@ -209,7 +209,7 @@ func ansi256Color(n int) lipgloss.Color
 
 **Логика:**
 - `0-15` — стандартные 16 цветов
-- `16-231` — 6x6x6 куб
+- `16-231` — xterm 6x6x6 куб с уровнями `0, 95, 135, 175, 215, 255`
 - `232-255` — оттенки серого
 
 ---
@@ -309,6 +309,10 @@ func (p *Parser) clearFromCursor()
 |----------|-------|
 | `1` | application cursor keys |
 | `25` | видимость курсора |
+| `1000` | mouse press/release tracking |
+| `1002` | mouse button-motion tracking |
+| `1003` | mouse all-motion tracking |
+| `1006` | SGR mouse encoding |
 | `1049` | альтернативный буфер экрана |
 | `2004` | bracketed paste |
 | `2026` | синхронизированный вывод |
@@ -459,3 +463,12 @@ CSI 200~ → statePaste
 ### Оттенки серого (232-255)
 
 Видимость: `(n-232)*10 + 8`
+
+
+## Resource bounds and validation
+
+- CSI buffer ограничен 4096 байт; malformed/unterminated CSI не может расти бесконечно.
+- OSC buffer ограничен 64 KiB.
+- Invalid UTF-8 восстанавливается через replacement rune без накопления неограниченного \`utf8Buf\`.
+- OSC 7 path percent-decode'ится как URL path и отклоняется при NUL, BEL, ESC, CR или LF.
+- 256-color cube соответствует xterm, а RGB компоненты clamp'ятся к 0…255.
