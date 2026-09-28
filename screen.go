@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/charmbracelet/lipgloss"
 	"github.com/rivo/uniseg"
@@ -47,6 +48,7 @@ type Screen struct {
 
 	savedCursor             Cursor
 	savedCells              [][]Cell
+	altScreen               bool
 	scrollTop, scrollBottom int  // 0-indexed, DECSTBM. Default 0, Rows-1.
 	wrapPending             bool // true after writing to last column; next char wraps.
 
@@ -60,6 +62,10 @@ type Screen struct {
 
 	applicationCursor  bool
 	bracketedPaste     bool
+	mouseMode1000      bool
+	mouseMode1002      bool
+	mouseMode1003      bool
+	mouseSGR           bool
 	CursorVisible      bool
 	CursorBlinkVisible bool // toggled by emulator for blinking cursor
 
@@ -253,11 +259,20 @@ type Cursor struct {
 
 // defaultScrollbackLimit caps the scrollback buffer to prevent unbounded
 // memory growth for long-running sessions.
-const defaultScrollbackLimit = 10000
+const (
+	defaultScrollbackLimit = 10000
+	maxGraphemeBytes       = 4096
+)
 
 // NewScreen creates a new screen with the given dimensions.
 // Scrollback is capped to defaultScrollbackLimit lines by default.
 func NewScreen(rows, cols int) *Screen {
+	if rows < 1 {
+		rows = 1
+	}
+	if cols < 1 {
+		cols = 1
+	}
 	s := &Screen{
 		Rows:            rows,
 		Cols:            cols,
@@ -279,16 +294,46 @@ func (s *Screen) SetScrollbackLimit(limit int) {
 	if limit > 0 && len(s.scrollback) > limit {
 		s.scrollback = s.scrollback[len(s.scrollback)-limit:]
 	}
+	if s.viewOffset > len(s.scrollback) {
+		s.viewOffset = len(s.scrollback)
+	}
+}
+
+func resizeCellGrid(old [][]Cell, rows, cols int) [][]Cell {
+	grid := make([][]Cell, rows)
+	for r := 0; r < rows; r++ {
+		grid[r] = make([]Cell, cols)
+		if r < len(old) {
+			copy(grid[r], old[r])
+		}
+	}
+	return grid
+}
+
+func sanitizeCellRow(cells []Cell) {
+	for col := range cells {
+		cell := cells[col]
+		if cell.Continuation {
+			if col == 0 || cells[col-1].Continuation || cellDisplayWidth(cells[col-1]) != 2 {
+				cells[col] = Cell{}
+			}
+			continue
+		}
+		if cell.Rune != 0 && cellDisplayWidth(cell) == 2 {
+			if col+1 >= len(cells) || !cells[col+1].Continuation {
+				cells[col] = Cell{}
+			}
+		}
+	}
 }
 
 func (s *Screen) resize(rows, cols int) {
 	s.markDirty()
-	old := s.Cells
-	s.Cells = make([][]Cell, rows)
-	for r := 0; r < rows; r++ {
-		s.Cells[r] = make([]Cell, cols)
-		if r < len(old) {
-			copy(s.Cells[r], old[r])
+	s.Cells = resizeCellGrid(s.Cells, rows, cols)
+	if s.savedCells != nil {
+		s.savedCells = resizeCellGrid(s.savedCells, rows, cols)
+		for row := range s.savedCells {
+			sanitizeCellRow(s.savedCells[row])
 		}
 	}
 	s.Rows = rows
@@ -355,6 +400,12 @@ func (s *Screen) normalizeScrollback() {
 
 // Resize resizes the screen, preserving existing content.
 func (s *Screen) Resize(rows, cols int) {
+	if rows < 1 {
+		rows = 1
+	}
+	if cols < 1 {
+		cols = 1
+	}
 	if rows == s.Rows && cols == s.Cols {
 		return
 	}
@@ -450,21 +501,7 @@ func (s *Screen) sanitizeWideRow(row int) {
 	if row < 0 || row >= len(s.Cells) {
 		return
 	}
-	cells := s.Cells[row]
-	for col := range cells {
-		cell := cells[col]
-		if cell.Continuation {
-			if col == 0 || cells[col-1].Continuation || cellDisplayWidth(cells[col-1]) != 2 {
-				cells[col] = Cell{}
-			}
-			continue
-		}
-		if cell.Rune != 0 && cellDisplayWidth(cell) == 2 {
-			if col+1 >= len(cells) || !cells[col+1].Continuation {
-				cells[col] = Cell{}
-			}
-		}
-	}
+	sanitizeCellRow(s.Cells[row])
 }
 
 func (s *Screen) previousBaseCell() (row, col int, ok bool) {
@@ -576,6 +613,9 @@ func (s *Screen) appendToPreviousCluster(r rune) bool {
 		return false
 	}
 	cell := &s.Cells[row][col]
+	if utf8.RuneLen(r) > 0 && len(cell.Combining)+utf8.RuneLen(r) > maxGraphemeBytes {
+		return true
+	}
 	prev := cellText(*cell)
 
 	// If the previous cell is empty (e.g. continuation cell with Rune==0),
@@ -834,7 +874,7 @@ func (s *Screen) scrollLineUp() {
 	if s.selectionActive {
 		s.selectionActive = false
 	}
-	if top == 0 {
+	if top == 0 && !s.altScreen {
 		if s.scrollbackLimit > 0 && len(s.scrollback) >= s.scrollbackLimit {
 			// Reuse the oldest scrollback line to avoid allocating a new slice.
 			line := s.scrollback[0]
@@ -1014,25 +1054,27 @@ func (s *Screen) RestoreCursor() {
 
 // EnterAltScreen saves the current screen and clears it.
 func (s *Screen) EnterAltScreen() {
-	s.markDirty()
-	s.savedCells = make([][]Cell, s.Rows)
-	for r := 0; r < s.Rows; r++ {
-		s.savedCells[r] = make([]Cell, s.Cols)
-		copy(s.savedCells[r], s.Cells[r])
+	if s.altScreen {
+		return
 	}
+	s.markDirty()
+	s.savedCells = resizeCellGrid(s.Cells, s.Rows, s.Cols)
 	s.savedCursor = s.Cursor
+	s.altScreen = true
+	s.viewOffset = 0
 	s.Clear()
 	s.SetCursor(0, 0)
 }
 
 // ExitAltScreen restores the saved screen.
 func (s *Screen) ExitAltScreen() {
-	if s.savedCells == nil {
+	if s.savedCells == nil || !s.altScreen {
 		return
 	}
 	s.markDirty()
 	s.Cells = s.savedCells
 	s.savedCells = nil
+	s.altScreen = false
 	row := s.savedCursor.Row
 	col := s.savedCursor.Col
 	if row < 0 {
@@ -1123,6 +1165,9 @@ func (s *Screen) LineText(row int) string {
 
 // ScrollViewUp moves the view up into the scrollback by n lines.
 func (s *Screen) ScrollViewUp(n int) {
+	if n <= 0 {
+		return
+	}
 	max := len(s.scrollback)
 	if max == 0 {
 		return
@@ -1136,6 +1181,9 @@ func (s *Screen) ScrollViewUp(n int) {
 
 // ScrollViewDown moves the view down towards the live screen by n lines.
 func (s *Screen) ScrollViewDown(n int) {
+	if n <= 0 {
+		return
+	}
 	s.markDirty()
 	s.viewOffset -= n
 	if s.viewOffset < 0 {
@@ -1149,6 +1197,23 @@ func (s *Screen) ResetView() {
 		s.markDirty()
 	}
 	s.viewOffset = 0
+}
+
+func (s *Screen) mouseTrackingMode() int {
+	if s.mouseMode1003 {
+		return 1003
+	}
+	if s.mouseMode1002 {
+		return 1002
+	}
+	if s.mouseMode1000 {
+		return 1000
+	}
+	return 0
+}
+
+func (s *Screen) mouseReportingEnabled() bool {
+	return s.mouseTrackingMode() != 0
 }
 
 // SetSync enables or disables synchronized output (ESC[?2026h/l).
