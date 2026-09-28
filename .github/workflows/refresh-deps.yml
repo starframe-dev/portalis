@@ -1,0 +1,39 @@
+name: Refresh dependency files
+
+on:
+  push:
+    paths:
+      - ".github/workflows/refresh-deps.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.25.8"
+          cache: true
+      - name: Upgrade compatible v1 dependencies
+        run: |
+          go get github.com/charmbracelet/bubbletea@v1.3.10
+          go get github.com/charmbracelet/lipgloss@v1.1.0
+          go get github.com/charmbracelet/x/ansi@v0.10.1
+          go mod tidy
+      - name: Print generated module files
+        run: |
+          echo "===GO_MOD_BEGIN==="
+          cat go.mod
+          echo "===GO_MOD_END==="
+          echo "===GO_SUM_BEGIN==="
+          cat go.sum
+          echo "===GO_SUM_END==="
+      - name: Verify upgraded graph
+        run: |
+          go vet ./...
+          go test ./...
+          go test -race ./...
