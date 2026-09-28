@@ -14,7 +14,7 @@ and forwards keyboard, mouse and resize events.
 - Editing sequences: ICH (`CSI @`), DCH (`CSI P`), ECH (`CSI X`), IL (`CSI L`), DL (`CSI M`), SU (`CSI S`), SD (`CSI T`), VPA (`CSI d`), HPA (`CSI G`)
 - Scroll regions, index/reverse index, DEC Special Graphics charset
 - OSC 7 working-directory tracking with callbacks
-- OSC 52 clipboard integration (macOS, Wayland, X11)
+- System clipboard selection and explicit paste integration (macOS, Wayland, X11)
 - Synchronized output (`CSI ? 2026 h/l`)
 - Selection with mouse drag, scrollback up to 10 000 lines
 - Alt screen, bracketed paste, command history
@@ -60,7 +60,7 @@ The host calls `Update(msg)` with `tea.KeyMsg`, `tea.MouseMsg`, `ResizeMsg`,
 | `emulator.go` | Top-level controller. Coordinates Screen, Parser and PTY. |
 | `screen.go` | 2D cell grid, scrollback, selection, rendering, dirty cache. |
 | `ansi.go` | ANSI/VT escape parser (CSI, OSC, SGR, UTF-8, DEC modes). |
-| `pty.go` | PTY spawn / read / write / resize / output coalescing. |
+| `pty.go` | PTY spawn / ordered reads / write / resize / lifecycle. |
 | `clipboard.go` | OSC 52 with platform backends. |
 
 ```
@@ -87,7 +87,7 @@ go test ./...
 go test -race ./...
 ```
 
-Unit tests cover ANSI sequences, screen operations, key encoding, and PTY resize/coalescing. Visual E2E with `tmux` is run via `cuetty-cli` (see `cuetty-artifacts/portalis-tmux/`).
+Unit tests cover ANSI sequences, screen operations, key encoding, and PTY resize/ordered reads. Visual E2E with `tmux` is run via `cuetty-cli` (see `cuetty-artifacts/portalis-tmux/`).
 
 Note: `clipboard_mac_test.go` runs only on macOS; other tests are portable.
 
