@@ -94,6 +94,12 @@ func pasteMac() (string, string, error) {
 	if path, err := pasteMacImage(); err == nil && path != "" {
 		// Confirm it actually exists and is non-empty.
 		if info, statErr := os.Stat(path); statErr == nil && info.Size() > 0 {
+			const maxClipboardImageBytes = 100 << 20
+			if info.Size() > maxClipboardImageBytes {
+				_ = os.Remove(path)
+				return "", "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardImageBytes)
+			}
+			_ = os.Chmod(path, 0o600)
 			return "", path, nil
 		}
 	}
@@ -169,17 +175,26 @@ func pasteX11() (string, string, error) {
 }
 
 func saveImageBytes(data []byte) (string, error) {
-	// Verify it's a valid PNG before saving.
-	if _, _, err := image.DecodeConfig(bytes.NewReader(data)); err != nil {
+	const maxClipboardImageBytes = 100 << 20
+	const maxClipboardImagePixels = 100_000_000
+	if len(data) > maxClipboardImageBytes {
+		return "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardImageBytes)
+	}
+	// Verify dimensions before full decoding to bound memory use.
+	config, _, err := image.DecodeConfig(bytes.NewReader(data))
+	if err != nil {
 		return "", err
 	}
+	if config.Width <= 0 || config.Height <= 0 || int64(config.Width)*int64(config.Height) > maxClipboardImagePixels {
+		return "", fmt.Errorf("clipboard image dimensions %dx%d exceed limit", config.Width, config.Height)
+	}
 	dir := filepath.Join(os.TempDir(), "automata-clip")
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return "", err
 	}
 	name := fmt.Sprintf("paste-%d.png", time.Now().UnixNano())
 	path := filepath.Join(dir, name)
-	if err := os.WriteFile(path, data, 0o644); err != nil {
+	if err := os.WriteFile(path, data, 0o600); err != nil {
 		return "", err
 	}
 	// Also decode & re-encode via png to confirm validity (drops any junk).
