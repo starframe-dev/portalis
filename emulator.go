@@ -190,6 +190,12 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 
 	if width > 0 && height > 0 {
 		if err := pty.Resize(height, width); err != nil {
+			e.mu.Lock()
+			if e.pty == pty && e.listenerGeneration == generation {
+				e.pty = nil
+				e.listenerGeneration++
+			}
+			e.mu.Unlock()
 			_ = pty.Close()
 			return fmt.Errorf("resize pty: %w", err)
 		}
@@ -243,6 +249,11 @@ func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
 
 		if width > 0 && height > 0 {
 			if err := pty.Resize(height, width); err != nil {
+				e.mu.Lock()
+				if e.pty == pty && e.listenerGeneration == generation {
+					e.pty = nil
+				}
+				e.mu.Unlock()
 				_ = pty.Close()
 				return PtyExitMsg{SessionID: sessionID, Generation: generation, Err: fmt.Errorf("resize pty: %w", err)}
 			}
