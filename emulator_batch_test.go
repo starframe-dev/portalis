@@ -357,3 +357,64 @@ func TestErrorMessagesReachOnError(t *testing.T) {
 		t.Fatalf("OnError calls = %d, want 2", got)
 	}
 }
+
+func TestStaleReadyGenerationDoesNotStartListener(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.resetTerminalLocked()
+	current := em.listenerGeneration
+	em.pty = &Pty{Output: make(chan []byte), Errors: make(chan error)}
+	em.mu.Unlock()
+
+	if cmd := em.Update(PtyReadyMsg{SessionID: "session", Generation: current - 1}); cmd != nil {
+		t.Fatal("stale PtyReadyMsg started a listener")
+	}
+}
+
+func TestLocalDragReleaseWinsAfterShiftIsReleased(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.screen = NewScreen(1, 8)
+	em.screen.PutBytes([]byte("selection"))
+	em.screen.mouseMode1000 = true
+	em.screen.StartSelection(0, 0)
+	em.screen.ExtendSelection(0, 3)
+	em.dragSelecting = true
+	em.mu.Unlock()
+
+	_ = em.handleMouse(tea.MouseMsg{
+		X:      3,
+		Y:      0,
+		Action: tea.MouseActionRelease,
+		Button: tea.MouseButtonLeft,
+	})
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	if em.dragSelecting {
+		t.Fatal("local drag remained active after release without Shift")
+	}
+	if em.screen.selectionActive {
+		t.Fatal("selection remained active after local release")
+	}
+}
+
+func TestCloseRemovesTrackedClipboardTempFiles(t *testing.T) {
+	file, err := os.CreateTemp("", "portalis-cleanup-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := file.Name()
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.tempFiles = append(em.tempFiles, path)
+	em.mu.Unlock()
+	em.Close()
+
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("tracked temp file still exists after Close: %v", err)
+	}
+}
