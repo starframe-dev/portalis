@@ -484,7 +484,7 @@ func (s *Screen) ClearLineAll() {
 		return
 	}
 	s.markDirty()
-	clear(s.Cells[s.Cursor.Row])
+	s.fillBlank(s.Cells[s.Cursor.Row], 0, s.Cols)
 	s.wrapPending = false
 }
 
@@ -821,10 +821,10 @@ func (s *Screen) PutBytes(data []byte) int {
 	// Clear wide-cell footprints intersecting the run boundaries so an ASCII
 	// overwrite cannot leave an orphan base or continuation cell.
 	if cells[col].Continuation && col > 0 {
-		cells[col-1] = Cell{}
+		cells[col-1] = s.blankCell()
 	}
 	if col+n < s.Cols && cells[col+n].Continuation {
-		cells[col+n] = Cell{}
+		cells[col+n] = s.blankCell()
 	}
 
 	// Fill cells directly without allocating a temporary slice.
@@ -841,6 +841,7 @@ func (s *Screen) PutBytes(data []byte) int {
 		if s.Cursor.Col >= s.Cols {
 			s.Cursor.Col = s.Cols - 1
 		}
+		s.sanitizeWideRow(row)
 		return n
 	}
 	for k := 0; k < n; k++ {
