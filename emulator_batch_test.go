@@ -213,3 +213,67 @@ func TestCommandHistoryCallbackMayReenterEmulator(t *testing.T) {
 		t.Fatal("history callback deadlocked while re-entering Emulator")
 	}
 }
+
+
+func TestStopCancelsQueuedStartCommand(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	cmd := em.Start()
+	if cmd == nil {
+		t.Fatal("Start returned nil command")
+	}
+	em.Stop()
+	if msg := cmd(); msg != nil {
+		t.Fatalf("cancelled Start returned %T, want nil", msg)
+	}
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	if em.pty != nil {
+		t.Fatal("cancelled Start spawned a PTY")
+	}
+	if !em.stopped {
+		t.Fatal("Stop state was cleared by cancelled Start")
+	}
+}
+
+func TestResetTerminalClearsStaleCWD(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.SetInitialCWD("/initial")
+	em.mu.Lock()
+	em.cwd = "/old"
+	em.resetTerminalLocked()
+	em.mu.Unlock()
+	if got := em.CWD(); got != "/initial" {
+		t.Fatalf("CWD after reset = %q, want /initial fallback", got)
+	}
+}
+
+func TestMouseEncodingUsesCorrectXtermCodes(t *testing.T) {
+	wheel := tea.MouseMsg{X: 1, Y: 2, Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp}
+	if got, want := string(mouseToBytes(wheel, true)), "[<64;2;3M"; got != want {
+		t.Fatalf("SGR wheel = %q, want %q", got, want)
+	}
+
+	left := tea.MouseMsg{X: 0, Y: 0, Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}
+	got := mouseToBytes(left, false)
+	want := []byte{0x1b, '[', 'M', 32, 33, 33}
+	if string(got) != string(want) {
+		t.Fatalf("X10 left = %v, want %v", got, want)
+	}
+}
+
+func TestMouseTrackingRules(t *testing.T) {
+	press := tea.MouseMsg{Action: tea.MouseActionPress, Button: tea.MouseButtonLeft}
+	if shouldReportMouse(0, press) {
+		t.Fatal("mouse press reported with tracking disabled")
+	}
+	if !shouldReportMouse(1000, press) {
+		t.Fatal("mouse press not reported in mode 1000")
+	}
+	motionNone := tea.MouseMsg{Action: tea.MouseActionMotion, Button: tea.MouseButtonNone}
+	if shouldReportMouse(1002, motionNone) {
+		t.Fatal("buttonless motion reported in mode 1002")
+	}
+	if !shouldReportMouse(1003, motionNone) {
+		t.Fatal("buttonless motion not reported in mode 1003")
+	}
+}
