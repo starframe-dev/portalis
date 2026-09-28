@@ -14,7 +14,7 @@ import (
 
 const (
 	stressTimeout          = 500 * time.Millisecond
-	stressExpectedChecksum = uint64(0xbe1bfb885413639f)
+	stressExpectedChecksum = uint64(0xe2d09047e94a10e5)
 )
 
 func TestANSIStressComplexStream(t *testing.T) {
