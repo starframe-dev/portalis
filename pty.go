@@ -30,9 +30,11 @@ type Pty struct {
 	Output         chan []byte
 	Errors         chan error
 	done           chan struct{}
+	readDone       chan struct{}
 	closeOnce      sync.Once
 	mu             sync.Mutex
 	closeErr       error
+	terminalErr    error
 
 	lastRows int
 	lastCols int
@@ -61,9 +63,10 @@ func SpawnInDir(command string, args []string, dir string, env ...string) (*Pty,
 		cmd:    cmd,
 		ptmx:   ptmx,
 		reader: bufio.NewReader(ptmx),
-		Output: make(chan []byte, 64),
-		Errors: make(chan error, 1),
-		done:   make(chan struct{}),
+		Output:   make(chan []byte, 64),
+		Errors:   make(chan error, 1),
+		done:     make(chan struct{}),
+		readDone: make(chan struct{}),
 	}
 	if traceBase := os.Getenv("PORTALIS_RAW_TRACE"); traceBase != "" {
 		tracePath := fmt.Sprintf("%s.%d", traceBase, cmd.Process.Pid)
@@ -82,11 +85,12 @@ func SpawnInDir(command string, args []string, dir string, env ...string) (*Pty,
 // Write sends data to the PTY.
 func (p *Pty) Write(data []byte) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.ptmx == nil {
+	ptmx := p.ptmx
+	p.mu.Unlock()
+	if ptmx == nil {
 		return fmt.Errorf("pty closed")
 	}
-	_, err := p.ptmx.Write(data)
+	_, err := ptmx.Write(data)
 	return err
 }
 
@@ -154,6 +158,9 @@ func (p *Pty) Close() error {
 
 func (p *Pty) readLoop() {
 	buf := make([]byte, 4096)
+	if p.readDone != nil {
+		defer close(p.readDone)
+	}
 	defer close(p.Errors)
 	if p.rawTrace != nil {
 		defer p.rawTrace.Close()
@@ -193,10 +200,18 @@ func (p *Pty) readLoop() {
 			}
 		}
 		if err != nil {
+			select {
+			case <-p.done:
+				return
+			default:
+			}
 			if err != io.EOF {
+				p.mu.Lock()
+				p.terminalErr = err
+				p.mu.Unlock()
 				select {
 				case p.Errors <- err:
-				case <-p.done:
+				default:
 				}
 			}
 			return
@@ -218,11 +233,19 @@ type PtyExitMsg struct {
 	Err        error
 }
 
+// PtyErrorMsg reports an error from a standalone PTY helper such as SendBytes.
+type PtyErrorMsg struct {
+	Err error
+}
+
 // SendBytes sends raw bytes to the PTY.
 func SendBytes(p *Pty, data []byte) tea.Cmd {
 	return func() tea.Msg {
-		if p != nil {
-			p.Write(data)
+		if p == nil {
+			return nil
+		}
+		if err := p.Write(data); err != nil {
+			return PtyErrorMsg{Err: err}
 		}
 		return nil
 	}
@@ -233,6 +256,29 @@ func SendBytes(p *Pty, data []byte) tea.Cmd {
 // 64 KiB Parser.Feed call from blocking the UI update loop.
 func (p *Pty) Listen(sessionID string) tea.Cmd {
 	return func() tea.Msg {
+		// Spawned PTYs use readDone so process completion cannot overtake
+		// already-buffered output. Drain Output first, then report the terminal
+		// error/EOF only after the read loop has finished.
+		if p.readDone != nil {
+			for {
+				select {
+				case data := <-p.Output:
+					return PtyOutputMsg{SessionID: sessionID, Data: data}
+				case <-p.readDone:
+					select {
+					case data := <-p.Output:
+						return PtyOutputMsg{SessionID: sessionID, Data: data}
+					default:
+					}
+					p.mu.Lock()
+					err := p.terminalErr
+					p.mu.Unlock()
+					return PtyExitMsg{SessionID: sessionID, Err: err}
+				}
+			}
+		}
+
+		// Compatibility path for tests or manually-constructed Pty values.
 		select {
 		case data, ok := <-p.Output:
 			if !ok {
