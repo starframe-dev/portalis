@@ -231,7 +231,7 @@ Emulator использует Bubble Tea для обработки событи�
 
 ### 5. OSC 7 для рабочей директории
 
-- PTY конфигурируется с `PROMPT_COMMAND` для эмитирования OSC 7
+- PTY конфигурируется с `PROMPT_COMMAND` для эмитирования OSC 7; путь percent-encode'ится перед помещением в control sequence
 - Callback вызывается при изменении cwd
 - Поддержка форматов `file://hostname/path` и `/absolute/path`
 
@@ -259,7 +259,7 @@ Emulator использует Bubble Tea для обработки событи�
 ### 9. Размер PTY и производительность
 
 - `Pty.Resize` применяет каждый размер напрямую через `pty.Setsize`, без потерь из-за throttle.
-- `Pty.Listen` при наличии нескольких queued chunks объединяет их в один `PtyOutputMsg` до 64 KiB, чтобы избежать лишних полных рендеров.
+- `Pty.Listen` выдаёт упорядоченные read chunks до 4 KiB и гарантированно дренирует уже прочитанный вывод перед `PtyExitMsg`.
 - `Screen` использует dirty cache: неизменившийся кадр возвращает предыдущий render, инвалидация происходит при любом изменении ячеек/курсора/выделения/режимов.
 
 ## Ограничения
@@ -299,3 +299,13 @@ Emulator использует Bubble Tea для обработки событи�
 - `code-specs/pty.md` — детальная спецификация PTY
 - `code-specs/emulator.md` — детальная спецификация Emulator
 - `code-specs/clipboard.md` — детальная спецификация Clipboard
+
+
+## Hardening invariants
+
+- \`Pty.Close()\` идемпотентен и может закрыть fd, пока другая goroutine заблокирована в \`Write\`.
+- EOF/error публикуется только после всех уже прочитанных PTY chunks.
+- Alternate screen не пишет в основной scrollback; оба screen buffer меняют размер согласованно.
+- Grapheme cluster имеет ограничение размера, чтобы hostile terminal output не создавал неограниченные строки.
+- Mouse events передаются child process только после DECSET 1000/1002/1003; 1006 выбирает SGR encoding. Shift принудительно оставляет mouse event локальному selection/scrollback.
+- Публичные размеры Screen нормализуются минимум к 1×1.
