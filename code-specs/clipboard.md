@@ -141,27 +141,27 @@ func saveImageBytes(data []byte) (string, error)
 Сохраняет байты изображения во временный файл.
 
 **Поведение:**
-- Проверяет, что данные являются валидным PNG через `image.DecodeConfig`.
-- Создаёт директорию в `/tmp/automata-clip`.
-- Сохраняет файл с именем `paste-<timestamp>.png`.
-- Декодирует и перекодирует изображение через `png.Encode`, чтобы убедиться в валидности и очистить мусор.
+- Ограничивает вход 100 MiB и 100 000 000 пикселей до полного decode.
+- Проверяет PNG через `image.DecodeConfig`, затем декодирует и перекодирует через `png.Encode`.
+- Создаёт приватную директорию `/tmp/portalis-clip` (`0700`) и файл через `os.CreateTemp` (`0600`).
 - Возвращает путь к сохранённому файлу или ошибку.
 
 ---
 
-### handlePaste
+### PasteFromClipboard
 
 ```go
-func (e *Emulator) handlePaste() tea.Cmd
+func (e *Emulator) PasteFromClipboard() tea.Cmd
 ```
 
 Обработчик пасты в TUI на основе Bubble Tea.
 
 **Поведение:**
-- Получает содержимое буфера обмена через `pasteFromClipboard`.
-- Если ошибка или пустой результат, возвращает `nil`.
-- Если содержимое — изображение, записывает путь к файлу в PTY (без bracketed paste).
-- Если содержимое — текст, использует bracketed paste (ESC[200~...ESC[201~).
+- Возвращает `tea.Cmd`, поэтому системные clipboard-команды не блокируют Emulator mutex/UI loop.
+- Ошибка clipboard возвращается как `ClipboardErrorMsg`.
+- Ошибка записи PTY возвращается как `PtyExitMsg` с generation.
+- Если содержимое — изображение, записывает путь к защищённому temp-файлу в PTY.
+- Текст оборачивается в bracketed paste только если child включил DECSET `?2004`; иначе передаётся plain text.
 
 ---
 
@@ -181,7 +181,7 @@ let candidates: [(NSPasteboard.PasteboardType, String)] = [
 for (t, ext) in candidates {
     if let data = pb.data(forType: t) {
         let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("automata-paste-\(UUID().uuidString).\(ext)")
+            .appendingPathComponent("portalis-paste-\(UUID().uuidString).\(ext)")
         do {
             try data.write(to: url)
             print("PATH:\(url.path)")
@@ -213,7 +213,7 @@ print("NO_IMAGE")
 
 ### 2. Обработка изображений
 
-Изображения сохраняются во временную директорию `/tmp/automata-clip/` с правами `0644`.
+Изображения сохраняются во временную директорию `/tmp/portalis-clip/` с правами `0600`.
 Имена файлов включают временную метку в наносекундах.
 Изображения перекодируются через `png.Encode` для гарантии чистоты данных.
 
@@ -277,3 +277,11 @@ macOS `pbpaste` возвращает только текстовое предс�
 - Код работает только на платформах с соответствующими инструментами буфера обмена.
 - Изображения сохраняются во временную директорию и должны быть удалены после использования (по желанию).
 - Swift требуется для работы с изображениями на macOS.
+
+
+## Security bounds
+
+- Clipboard image bytes: максимум 100 MiB.
+- Decoded image dimensions: максимум 100 000 000 пикселей.
+- Swift reader на macOS проверяет размер данных до записи temp-файла.
+- Имена PNG создаются атомарно через \`os.CreateTemp\`; предсказуемых timestamp-имён нет.
