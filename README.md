@@ -18,7 +18,7 @@ and forwards keyboard, mouse and resize events.
 - Synchronized output (`CSI ? 2026 h/l`)
 - Selection with mouse drag, scrollback up to 10 000 lines
 - Alt screen, bracketed paste, command history
-- Render dirty-cache and PTY output coalescing for performance
+- Render dirty-cache and ordered 4 KiB PTY reads for responsive streaming
 - Framework-agnostic core: feed events, call `View(w, h)` to render
 
 ## Installation
