@@ -291,11 +291,11 @@ func TestANSI256ColorXtermCube(t *testing.T) {
 func TestParserMousePrivateModes(t *testing.T) {
 	s := NewScreen(2, 10)
 	p := NewParser(s)
-	p.Feed([]byte("[?1002;1006h"))
+	p.Feed([]byte("\x1b[?1002;1006h"))
 	if s.mouseTrackingMode() != 1002 || !s.mouseSGR {
 		t.Fatalf("mouse modes not enabled: tracking=%d sgr=%v", s.mouseTrackingMode(), s.mouseSGR)
 	}
-	p.Feed([]byte("[?1002;1006l"))
+	p.Feed([]byte("\x1b[?1002;1006l"))
 	if s.mouseTrackingMode() != 0 || s.mouseSGR {
 		t.Fatalf("mouse modes not disabled: tracking=%d sgr=%v", s.mouseTrackingMode(), s.mouseSGR)
 	}
@@ -308,8 +308,7 @@ func TestOSC7PercentDecodedAndControlsRejected(t *testing.T) {
 	if got := extractOSC7Path("file://localhost/tmp/bad%1Bname"); got != "" {
 		t.Fatalf("OSC 7 control path accepted: %q", got)
 	}
-	if got := extractOSC7Path("/tmp/bad
-name"); got != "" {
+	if got := extractOSC7Path("/tmp/bad\nname"); got != "" {
 		t.Fatalf("raw OSC 7 newline path accepted: %q", got)
 	}
 }
