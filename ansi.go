@@ -26,6 +26,11 @@ type Parser struct {
 type ansiState int
 
 const (
+	maxCSISequenceBytes = 4096
+	maxOSCSequenceBytes = 64 * 1024
+)
+
+const (
 	stateNormal ansiState = iota
 	stateEscape
 	stateEscapeIntermediate
@@ -104,6 +109,11 @@ func (p *Parser) Feed(data []byte) {
 func (p *Parser) feedByte(b byte) {
 	switch p.state {
 	case stateNormal:
+		// An ASCII/control byte cannot continue a pending UTF-8 sequence.
+		// Flush the incomplete bytes before processing the current byte.
+		if b < 0x80 && len(p.utf8Buf) > 0 {
+			p.flushUtf8()
+		}
 		if b == 0x1b {
 			p.flushUtf8()
 			p.state = stateEscape
@@ -158,12 +168,15 @@ func (p *Parser) feedByte(b byte) {
 		// Collect UTF-8 multi-byte sequences.
 		if b >= 0x80 {
 			p.utf8Buf = append(p.utf8Buf, b)
-			if utf8Valid(p.utf8Buf) {
-				r, _ := utf8.DecodeRune(p.utf8Buf)
-				p.screen.Put(r)
+			if utf8.FullRune(p.utf8Buf) {
+				if utf8.Valid(p.utf8Buf) {
+					r, _ := utf8.DecodeRune(p.utf8Buf)
+					p.screen.Put(r)
+				} else {
+					p.screen.Put('\ufffd')
+				}
 				p.utf8Buf = p.utf8Buf[:0]
 			}
-			// Still collecting.
 			return
 		}
 
@@ -219,6 +232,13 @@ func (p *Parser) feedByte(b byte) {
 		}
 
 	case stateCSI:
+		// Bound malformed/unterminated control sequences so child output cannot
+		// grow parser memory without limit.
+		if p.buf.Len() >= maxCSISequenceBytes {
+			p.buf.Reset()
+			p.state = stateNormal
+			return
+		}
 		// Collect until final byte (0x40-0x7e)
 		p.buf.WriteByte(b)
 		if b >= 0x40 && b <= 0x7e {
@@ -228,6 +248,11 @@ func (p *Parser) feedByte(b byte) {
 		}
 
 	case stateOSC:
+		if p.buf.Len() >= maxOSCSequenceBytes {
+			p.buf.Reset()
+			p.state = stateNormal
+			return
+		}
 		if b == '\x07' {
 			p.handleOSC(p.buf.String())
 			p.state = stateNormal
