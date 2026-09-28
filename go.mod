@@ -1,4 +1,4 @@
-module github.com/Starframe/portalis
+module github.com/starframe-dev/portalis
 
 go 1.22
 
