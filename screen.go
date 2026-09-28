@@ -47,11 +47,15 @@ type Screen struct {
 	Cursor Cursor
 
 	savedCursor             Cursor // DECSC/DECRC state
+	savedOriginMode         bool
+	savedAutoWrap           bool
+	savedWrapPending        bool
 	savedCells              [][]Cell
 	altSavedCursor          Cursor
 	altSavedScrollTop       int
 	altSavedScrollBottom    int
 	altSavedOriginMode      bool
+	altSavedAutoWrap        bool
 	altSavedWrapPending     bool
 	altScreen               bool
 	scrollTop, scrollBottom int  // 0-indexed, DECSTBM. Default 0, Rows-1.
@@ -399,11 +403,9 @@ func (s *Screen) normalizeScrollback() {
 			copy(padded, line)
 			s.scrollback[i] = padded
 		}
-		// Drop dangling continuation cells at the new edge.
-		line = s.scrollback[i]
-		if s.Cols > 0 && line[s.Cols-1].Continuation {
-			line[s.Cols-1] = Cell{}
-		}
+		// Remove both dangling continuation cells and wide base cells whose
+		// continuation was truncated at the new right edge.
+		sanitizeCellRow(s.scrollback[i])
 	}
 }
 
@@ -855,6 +857,27 @@ func (s *Screen) PutBytes(data []byte) int {
 	return n
 }
 
+// RepeatPrevious repeats the preceding grapheme cluster n times (REP).
+func (s *Screen) RepeatPrevious(n int) {
+	if n <= 0 {
+		n = 1
+	}
+	row, col, ok := s.previousBaseCell()
+	if !ok {
+		return
+	}
+	cell := s.Cells[row][col]
+	text := cellText(cell)
+	if text == "" {
+		return
+	}
+	for range n {
+		for _, r := range text {
+			s.Put(r)
+		}
+	}
+}
+
 // SetCursor sets the cursor position (1-indexed in ANSI, 0-indexed here).
 func (s *Screen) SetCursor(row, col int) {
 	s.markDirty()
@@ -1124,6 +1147,9 @@ func normalizedCount(n, maximum int) int {
 // SaveCursor saves the current cursor position.
 func (s *Screen) SaveCursor() {
 	s.savedCursor = s.Cursor
+	s.savedOriginMode = s.originMode
+	s.savedAutoWrap = s.autoWrap
+	s.savedWrapPending = s.wrapPending
 }
 
 // RestoreCursor restores the saved cursor position.
@@ -1146,7 +1172,9 @@ func (s *Screen) RestoreCursor() {
 	s.Cursor = s.savedCursor
 	s.Cursor.Row = row
 	s.Cursor.Col = col
-	s.wrapPending = false
+	s.originMode = s.savedOriginMode
+	s.autoWrap = s.savedAutoWrap
+	s.wrapPending = s.savedWrapPending
 }
 
 // EnterAltScreen saves the current screen and clears it.
@@ -1160,6 +1188,7 @@ func (s *Screen) EnterAltScreen() {
 	s.altSavedScrollTop = s.scrollTop
 	s.altSavedScrollBottom = s.scrollBottom
 	s.altSavedOriginMode = s.originMode
+	s.altSavedAutoWrap = s.autoWrap
 	s.altSavedWrapPending = s.wrapPending
 	s.altScreen = true
 	s.viewOffset = 0
@@ -1206,6 +1235,7 @@ func (s *Screen) ExitAltScreen() {
 		s.scrollBottom = s.Rows - 1
 	}
 	s.originMode = s.altSavedOriginMode
+	s.autoWrap = s.altSavedAutoWrap
 	s.wrapPending = s.altSavedWrapPending
 }
 
