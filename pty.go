@@ -8,8 +8,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
-	"syscall"
 	"sync"
+	"syscall"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/creack/pty"
