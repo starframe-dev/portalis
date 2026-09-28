@@ -77,6 +77,7 @@ type Emulator struct {
 	// same PTY output channel concurrently.
 	listenerPending    bool
 	listenerGeneration uint64
+	lifecycleGeneration uint64
 
 	// Drag-select state: remember the press position and whether an
 	// actual drag is in progress. Selection starts only when the mouse
@@ -154,16 +155,15 @@ func (e *Emulator) SetScrollbackLimit(limit int) {
 // Returns an error if spawning fails.
 func (e *Emulator) StartSync(extraEnv []string) error {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-
 	if e.pty != nil {
+		e.mu.Unlock()
 		return nil
 	}
-
+	e.lifecycleGeneration++
 	e.resetTerminalLocked()
-
 	pty, err := e.spawnPty(e.effectiveEnv(extraEnv))
 	if err != nil {
+		e.mu.Unlock()
 		return err
 	}
 	e.pty = pty
@@ -171,44 +171,65 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 		e.screen.Resize(e.height, e.width)
 		if err := pty.Resize(e.height, e.width); err != nil {
 			e.pty = nil
+			e.listenerGeneration++
+			e.mu.Unlock()
 			_ = pty.Close()
 			return fmt.Errorf("resize pty: %w", err)
 		}
 	}
+	e.mu.Unlock()
 	return nil
 }
 
 // StartWithEnv begins spawning the PTY process with extra environment variables.
 func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
+	e.mu.Lock()
+	e.lifecycleGeneration++
+	lifecycle := e.lifecycleGeneration
+	env := e.effectiveEnv(extraEnv)
+	e.mu.Unlock()
+
 	return func() tea.Msg {
 		e.mu.Lock()
-		defer e.mu.Unlock()
-
+		if lifecycle != e.lifecycleGeneration {
+			e.mu.Unlock()
+			return nil
+		}
 		if e.pty != nil {
+			e.mu.Unlock()
 			return PtyReadyMsg{SessionID: e.SessionID, AlreadyRunning: true}
 		}
 
 		e.resetTerminalLocked()
-
-		pty, err := e.spawnPty(e.effectiveEnv(extraEnv))
+		pty, err := e.spawnPty(env)
 		if err != nil {
-			return PtyExitMsg{SessionID: e.SessionID, Err: err}
+			e.mu.Unlock()
+			return PtyExitMsg{SessionID: e.SessionID, Generation: e.listenerGeneration, Err: err}
+		}
+		if lifecycle != e.lifecycleGeneration {
+			e.mu.Unlock()
+			_ = pty.Close()
+			return nil
 		}
 		e.pty = pty
 		if e.width > 0 && e.height > 0 {
 			e.screen.Resize(e.height, e.width)
 			if err := pty.Resize(e.height, e.width); err != nil {
 				e.pty = nil
+				e.listenerGeneration++
+				e.mu.Unlock()
 				_ = pty.Close()
 				return PtyExitMsg{SessionID: e.SessionID, Generation: e.listenerGeneration, Err: fmt.Errorf("resize pty: %w", err)}
 			}
 		}
+		e.mu.Unlock()
 		return PtyReadyMsg{SessionID: e.SessionID}
 	}
 }
 
 func (e *Emulator) resetTerminalLocked() {
 	e.stopped = false
+	e.cwd = ""
 	e.pendingCWDChanges = nil
 	e.listenerPending = false
 	e.listenerGeneration++
@@ -226,15 +247,27 @@ func (e *Emulator) resetTerminalLocked() {
 	})
 }
 
+func envValue(extraEnv []string, key string) (string, bool) {
+	prefix := key + "="
+	for i := len(extraEnv) - 1; i >= 0; i-- {
+		if strings.HasPrefix(extraEnv[i], prefix) {
+			return strings.TrimPrefix(extraEnv[i], prefix), true
+		}
+	}
+	return os.LookupEnv(key)
+}
+
 func (e *Emulator) spawnPty(extraEnv []string) (*Pty, error) {
 	env := append([]string{"AUTOMATA_SESSION_ID=" + e.SessionID}, extraEnv...)
 
-	// Configure the shell to emit OSC 7 with the current directory after each
-	// prompt. Bash reads PROMPT_COMMAND from the environment. echo -e is used
-	// instead of printf because printf without a trailing newline can leave the
-	// cursor on the same line and interact poorly with the prompt redraw.
-	osc7Cmd := `echo -ne "\033]7;${PWD}\007"`
+	// Bash OSC 7 emitter. PWD is percent-encoded byte-by-byte before it is
+	// placed inside the control sequence, so unusual filenames cannot inject
+	// BEL/ESC or terminate the OSC payload. Preserve any caller PROMPT_COMMAND.
+	osc7Cmd := `__p="$PWD";__o="";LC_ALL=C;for ((__i=0;__i<${#__p};__i++));do __c=${__p:__i:1};case "$__c" in [a-zA-Z0-9/~._-])__o+="$__c";;*)printf -v __h '%%%02X' "'$__c";__o+="$__h";;esac;done;printf '\033]7;file://%s%s\007' "${HOSTNAME:-localhost}" "$__o";unset __p __o __i __c __h`
 	if e.cmd == "/bin/bash" || e.cmd == "/usr/bin/bash" || strings.HasSuffix(e.cmd, "/bash") {
+		if previous, ok := envValue(extraEnv, "PROMPT_COMMAND"); ok && strings.TrimSpace(previous) != "" {
+			osc7Cmd += ";" + previous
+		}
 		env = append(env, "PROMPT_COMMAND="+osc7Cmd)
 	}
 
@@ -347,18 +380,16 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		e.mu.Unlock()
 		return nil
 	case PtyOutputMsg:
-		e.mu.RLock()
-		currentGeneration := e.listenerGeneration
-		e.mu.RUnlock()
-		if msg.SessionID != e.SessionID || (msg.Generation != 0 && msg.Generation != currentGeneration) {
+		e.mu.Lock()
+		if msg.SessionID != e.SessionID || (msg.Generation != 0 && msg.Generation != e.listenerGeneration) {
+			e.mu.Unlock()
 			return nil
 		}
-		e.mu.Lock()
 		parser := e.parser
 		if parser != nil && len(msg.Data) > 0 {
-			// Feed one ordered 4 KiB PTY read immediately. Small bounded parser
-			// calls keep input and rendering responsive under sustained output.
-			// Full lock ensures View() doesn't read a half-updated screen.
+			// Validate generation and mutate the parser under the same lock so a
+			// Close/Start transition cannot redirect an old PTY chunk into a new
+			// terminal instance.
 			parser.Feed(msg.Data)
 		}
 		cwdChanges := append([]string(nil), e.pendingCWDChanges...)
@@ -385,6 +416,7 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		e.pty = nil
 		e.listenerPending = false
 		e.listenerGeneration++
+		e.lifecycleGeneration++
 		e.stopped = true
 		e.mu.Unlock()
 		if pty != nil {
@@ -495,30 +527,90 @@ func (e *Emulator) resetView() {
 	}
 }
 
+func isMouseButtonDown(button tea.MouseButton) bool {
+	switch button {
+	case tea.MouseButtonLeft, tea.MouseButtonMiddle, tea.MouseButtonRight,
+		tea.MouseButtonBackward, tea.MouseButtonForward, tea.MouseButton10, tea.MouseButton11:
+		return true
+	default:
+		return false
+	}
+}
+
+func shouldReportMouse(mode int, msg tea.MouseMsg) bool {
+	if mode == 0 {
+		return false
+	}
+	if msg.Button == tea.MouseButtonWheelUp || msg.Button == tea.MouseButtonWheelDown ||
+		msg.Button == tea.MouseButtonWheelLeft || msg.Button == tea.MouseButtonWheelRight {
+		return true
+	}
+	switch msg.Action {
+	case tea.MouseActionPress, tea.MouseActionRelease:
+		return true
+	case tea.MouseActionMotion:
+		return mode == 1003 || (mode == 1002 && isMouseButtonDown(msg.Button))
+	default:
+		return false
+	}
+}
+
 func (e *Emulator) handleMouse(msg tea.MouseMsg) tea.Cmd {
-	switch msg.Button {
-	case tea.MouseButtonWheelUp:
-		e.scrollUp(3)
-		return nil
-	case tea.MouseButtonWheelDown:
-		e.scrollDown(3)
+	e.mu.Lock()
+	screen := e.screen
+	pty := e.pty
+	generation := e.listenerGeneration
+	mode := 0
+	sgr := false
+	if screen != nil {
+		mode = screen.mouseTrackingMode()
+		sgr = screen.mouseSGR
+	}
+
+	// Shift forces local terminal selection/scrolling even when the child has
+	// enabled mouse reporting, matching conventional terminal behaviour.
+	reportToChild := mode != 0 && !msg.Shift
+	if reportToChild {
+		e.mu.Unlock()
+		if pty == nil || !shouldReportMouse(mode, msg) {
+			return nil
+		}
+		data := mouseToBytes(msg, sgr)
+		if len(data) == 0 {
+			return nil
+		}
+		if err := pty.Write(data); err != nil {
+			return func() tea.Msg {
+				return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
+			}
+		}
 		return nil
 	}
 
-	e.mu.Lock()
-	defer e.mu.Unlock()
+	if screen == nil {
+		e.mu.Unlock()
+		return nil
+	}
+	switch msg.Button {
+	case tea.MouseButtonWheelUp:
+		screen.ScrollViewUp(3)
+		e.mu.Unlock()
+		return nil
+	case tea.MouseButtonWheelDown:
+		screen.ScrollViewDown(3)
+		e.mu.Unlock()
+		return nil
+	}
 
+	var copyLines []string
 	switch msg.Action {
 	case tea.MouseActionPress:
-		if msg.Button == tea.MouseButtonLeft && e.screen != nil {
-			// Remember the press position but don't start selection
-			// yet — that requires actual drag motion. This keeps
-			// simple clicks (used by ai-knowledge) working.
+		if msg.Button == tea.MouseButtonLeft {
 			e.pressX, e.pressY = msg.X, msg.Y
 			e.dragSelecting = false
 		}
 	case tea.MouseActionMotion:
-		if msg.Button == tea.MouseButtonLeft && e.screen != nil {
+		if msg.Button == tea.MouseButtonLeft {
 			if !e.dragSelecting {
 				dx := msg.X - e.pressX
 				if dx < 0 {
@@ -529,46 +621,43 @@ func (e *Emulator) handleMouse(msg tea.MouseMsg) tea.Cmd {
 					dy = -dy
 				}
 				if dx > 0 || dy > 0 {
-					e.screen.StartSelection(e.pressY, e.pressX)
+					screen.StartSelection(e.pressY, e.pressX)
 					e.dragSelecting = true
 				}
 			}
 			if e.dragSelecting {
-				e.screen.ExtendSelection(msg.Y, msg.X)
-				return nil
+				screen.ExtendSelection(msg.Y, msg.X)
 			}
 		}
-		// Drop other motion to avoid PTY noise.
-		return nil
 	case tea.MouseActionRelease:
-		if msg.Button == tea.MouseButtonLeft {
-			if e.screen != nil && e.dragSelecting {
-				lines := e.screen.SelectionText()
-				e.screen.ClearSelection()
-				if len(lines) > 0 {
-					copyToClipboard(lines)
-				}
+		if msg.Button == tea.MouseButtonLeft || msg.Button == tea.MouseButtonNone {
+			if e.dragSelecting {
+				copyLines = screen.SelectionText()
+				screen.ClearSelection()
 			}
 			e.dragSelecting = false
 		}
 	}
+	e.mu.Unlock()
 
-	// Forward all events (including Press for left button) to PTY so
-	// apps like ai-knowledge receive complete click sequences.
-	if e.pty == nil {
+	if len(copyLines) == 0 {
 		return nil
 	}
-	data := mouseToBytes(msg)
-	if len(data) > 0 {
-		e.pty.Write(data)
+	return func() tea.Msg {
+		if err := copyToClipboard(copyLines); err != nil {
+			return ClipboardErrorMsg{Err: err}
+		}
+		return nil
 	}
-	return nil
 }
 
-// mouseToBytes encodes a bubbletea mouse event as an SGR mouse sequence so
-// that TUI applications running inside the PTY (e.g. ai-knowledge) receive
-// distinct press, release and wheel events.
-func mouseToBytes(msg tea.MouseMsg) []byte {
+// mouseToBytes encodes a Bubble Tea mouse event using either SGR extended
+// coordinates (?1006) or the legacy X10 encoding.
+func mouseToBytes(msg tea.MouseMsg, sgr bool) []byte {
+	if msg.X < 0 || msg.Y < 0 {
+		return nil
+	}
+
 	var cb int
 	switch msg.Button {
 	case tea.MouseButtonLeft:
@@ -578,11 +667,22 @@ func mouseToBytes(msg tea.MouseMsg) []byte {
 	case tea.MouseButtonRight:
 		cb = 2
 	case tea.MouseButtonWheelUp:
-		cb = 4
+		cb = 64
 	case tea.MouseButtonWheelDown:
-		cb = 5
+		cb = 65
+	case tea.MouseButtonWheelLeft:
+		cb = 66
+	case tea.MouseButtonWheelRight:
+		cb = 67
+	case tea.MouseButtonBackward:
+		cb = 128
+	case tea.MouseButtonForward:
+		cb = 129
+	case tea.MouseButton10:
+		cb = 130
+	case tea.MouseButton11:
+		cb = 131
 	default:
-		// Release with no button information.
 		cb = 3
 	}
 
@@ -599,15 +699,21 @@ func mouseToBytes(msg tea.MouseMsg) []byte {
 		cb |= 0b0001_0000
 	}
 
-	// SGR: ESC [ < Cb ; Cx ; Cy (M for press, m for release)
-	suffix := 'M'
-	if msg.Action == tea.MouseActionRelease {
-		suffix = 'm'
-	}
 	x := msg.X + 1
 	y := msg.Y + 1
-	seq := fmt.Sprintf("\x1b[<%d;%d;%d%c", cb, x, y, suffix)
-	return []byte(seq)
+	if sgr {
+		suffix := 'M'
+		if msg.Action == tea.MouseActionRelease {
+			suffix = 'm'
+		}
+		return []byte(fmt.Sprintf("\x1b[<%d;%d;%d%c", cb, x, y, suffix))
+	}
+
+	// Legacy X10 encoding supports coordinates only through 223.
+	if x > 223 || y > 223 || cb > 223 {
+		return nil
+	}
+	return []byte{0x1b, '[', 'M', byte(cb + 32), byte(x + 32), byte(y + 32)}
 }
 
 func (e *Emulator) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
@@ -655,26 +761,30 @@ func (e *Emulator) Blur() {
 // Close closes the PTY.
 func (e *Emulator) Close() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.pty != nil {
-		e.pty.Close()
-		e.pty = nil
-	}
+	pty := e.pty
+	e.pty = nil
 	e.listenerPending = false
 	e.listenerGeneration++
+	e.lifecycleGeneration++
+	e.mu.Unlock()
+	if pty != nil {
+		_ = pty.Close()
+	}
 }
 
 // Stop terminates the session and switches the panel to the idle ASCII art view.
 func (e *Emulator) Stop() {
 	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.pty != nil {
-		e.pty.Close()
-		e.pty = nil
-	}
+	pty := e.pty
+	e.pty = nil
 	e.listenerPending = false
 	e.listenerGeneration++
+	e.lifecycleGeneration++
 	e.stopped = true
+	e.mu.Unlock()
+	if pty != nil {
+		_ = pty.Close()
+	}
 }
 
 // SetInitialCWD sets the directory in which the PTY process starts.
