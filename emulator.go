@@ -169,7 +169,11 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 	e.pty = pty
 	if e.width > 0 && e.height > 0 {
 		e.screen.Resize(e.height, e.width)
-		pty.Resize(e.height, e.width)
+		if err := pty.Resize(e.height, e.width); err != nil {
+			e.pty = nil
+			_ = pty.Close()
+			return fmt.Errorf("resize pty: %w", err)
+		}
 	}
 	return nil
 }
@@ -193,7 +197,11 @@ func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
 		e.pty = pty
 		if e.width > 0 && e.height > 0 {
 			e.screen.Resize(e.height, e.width)
-			pty.Resize(e.height, e.width)
+			if err := pty.Resize(e.height, e.width); err != nil {
+				e.pty = nil
+				_ = pty.Close()
+				return PtyExitMsg{SessionID: e.SessionID, Generation: e.listenerGeneration, Err: fmt.Errorf("resize pty: %w", err)}
+			}
 		}
 		return PtyReadyMsg{SessionID: e.SessionID}
 	}
@@ -411,12 +419,14 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 	}
 
 	// Capture the command line before sending Enter to the PTY.
+	historyChanged := false
 	if msg.Type == tea.KeyEnter && e.screen != nil {
 		line := e.screen.LineText(e.screen.Cursor.Row)
 		cmd := stripPrompt(line)
 		if cmd != "" && (len(e.commandHistory) == 0 || e.commandHistory[len(e.commandHistory)-1] != cmd) {
 			const maxHistory = 1000
 			e.commandHistory = append(e.commandHistory, cmd)
+			historyChanged = true
 			if len(e.commandHistory) > maxHistory {
 				e.commandHistory = e.commandHistory[len(e.commandHistory)-maxHistory:]
 			}
@@ -431,7 +441,7 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 	generation := e.listenerGeneration
 	e.mu.Unlock()
 
-	if onHistoryChanged != nil && msg.Type == tea.KeyEnter {
+	if onHistoryChanged != nil && historyChanged {
 		onHistoryChanged(history)
 	}
 
@@ -606,27 +616,40 @@ func (e *Emulator) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
 }
 
 func (e *Emulator) handlePanelResize(msg ResizeMsg) tea.Cmd {
+	if msg.Width <= 0 || msg.Height <= 0 {
+		return nil
+	}
 	e.mu.Lock()
-	defer e.mu.Unlock()
 	e.width = msg.Width
 	e.height = msg.Height
 	if e.screen != nil {
 		e.screen.Resize(msg.Height, msg.Width)
 	}
-	if e.pty != nil {
-		e.pty.Resize(msg.Height, msg.Width)
+	pty := e.pty
+	generation := e.listenerGeneration
+	e.mu.Unlock()
+	if pty != nil {
+		if err := pty.Resize(msg.Height, msg.Width); err != nil {
+			return func() tea.Msg {
+				return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
+			}
+		}
 	}
 	return nil
 }
 
 // Focus marks the emulator as focused.
 func (e *Emulator) Focus() {
+	e.mu.Lock()
 	e.focused = true
+	e.mu.Unlock()
 }
 
 // Blur marks the emulator as blurred.
 func (e *Emulator) Blur() {
+	e.mu.Lock()
 	e.focused = false
+	e.mu.Unlock()
 }
 
 // Close closes the PTY.
