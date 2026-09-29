@@ -10,7 +10,7 @@
 ### copyToClipboard
 
 ```go
-func copyToClipboard(lines []string)
+func copyToClipboard(lines []string) error
 ```
 
 Отправляет заданный текст (соединённый новыми строками) в системный буфер обмена.
@@ -25,8 +25,9 @@ func copyToClipboard(lines []string)
   2. `xclip` (Linux X11)
   3. `xsel` (Linux X11)
   4. `wl-copy` (Wayland)
-- При успешном выполнении возвращает сразу.
-- Если ни один инструмент недоступен или не работает, функция завершается без возврата ошибки.
+- При успешном выполнении возвращает `nil`.
+- Текст и newline separators ограничены общим размером 100 MiB.
+- Если clipboard-инструменты недоступны или завершаются с ошибкой, возвращает последнюю ошибку.
 
 **Пример:**
 ```go
@@ -81,7 +82,7 @@ func pasteMac() (string, string, error)
 **Порядок выполнения:**
 1. Вызывает встраиваемый скрипт на Swift для извлечения изображения (любой UTI: PNG, JPEG, TIFF, PDF).
 2. Если изображение найдено и валидно, возвращает путь к сохранённому файлу.
-3. В качествеallback-а использует `pbpaste` для получения текста.
+3. Если Swift отсутствует или изображение не найдено, вызывает `pbpaste` для получения текста; прочие ошибки Swift возвращаются вызывающему коду.
 4. Если `pbpaste` случайно вернёт байты изображения, их проверяют по PNG-заголовку и сохраняют.
 
 ---
@@ -141,9 +142,9 @@ func saveImageBytes(data []byte) (string, error)
 Сохраняет байты изображения во временный файл.
 
 **Поведение:**
-- Ограничивает вход 100 MiB и 100 000 000 пикселей до полного decode.
+- Ограничивает вход 100 MiB и изображение 25 000 000 пикселями до полного декодирования.
 - Проверяет PNG через `image.DecodeConfig`, затем декодирует и перекодирует через `png.Encode`.
-- Создаёт приватную директорию `/tmp/portalis-clip` (`0700`) и файл через `os.CreateTemp` (`0600`).
+- Создаёт файл с непредсказуемым именем через `os.CreateTemp` в системном временном каталоге; права — `0600`.
 - Возвращает путь к сохранённому файлу или ошибку.
 
 ---
@@ -161,7 +162,8 @@ func (e *Emulator) PasteFromClipboard() tea.Cmd
 - Ошибка clipboard возвращается как `ClipboardErrorMsg`.
 - Ошибка записи PTY возвращается как `PtyExitMsg` с generation.
 - Если содержимое — изображение, записывает путь к защищённому temp-файлу в PTY.
-- Текст оборачивается в bracketed paste только если child включил DECSET `?2004`; иначе передаётся plain text.
+- Текст оборачивается в bracketed paste по актуальному DECSET `?2004`, проверенному после завершения чтения буфера обмена; иначе передаётся без обёртки.
+- Копирование выделения ограничено 100 MiB и 4 Mi посещёнными ячейками; превышение возвращает `ClipboardErrorMsg` до запуска внешней clipboard-команды.
 
 ---
 
@@ -180,6 +182,10 @@ let candidates: [(NSPasteboard.PasteboardType, String)] = [
 ]
 for (t, ext) in candidates {
     if let data = pb.data(forType: t) {
+        if data.count > __MAX_CLIPBOARD_BYTES__ {
+            print("ERR:clipboard image too large")
+            exit(1)
+        }
         let url = FileManager.default.temporaryDirectory
             .appendingPathComponent("portalis-paste-\(UUID().uuidString).\(ext)")
         do {
@@ -213,9 +219,7 @@ print("NO_IMAGE")
 
 ### 2. Обработка изображений
 
-Изображения сохраняются во временную директорию `/tmp/portalis-clip/` с правами `0600`.
-Имена файлов включают временную метку в наносекундах.
-Изображения перекодируются через `png.Encode` для гарантии чистоты данных.
+PNG сохраняется через `os.CreateTemp` с непредсказуемым именем и правами `0600`; Go ограничивает изображение 25 000 000 пикселями. Swift-reader на macOS ограничивает исходные данные буфера размером 100 MiB; перед передачей пути дочернему процессу Go повторно устанавливает права `0600`.
 
 ### 3. Bracketed Paste
 
@@ -274,29 +278,29 @@ macOS `pbpaste` возвращает только текстовое предс�
 
 ## Примечания
 
-- Код работает только на платформах с соответствующими инструментами буфера обмена.
-- Изображения сохраняются во временную директорию и должны быть удалены после использования (по желанию).
+- Код работает на платформах с соответствующими инструментами буфера обмена; ошибки чтения и записи возвращаются host через `ClipboardErrorMsg`.
+- Созданные PNG temp-файлы удаляются при ошибке/устаревшей сессии, а успешно переданные child файлы удаляются при `Stop`/`Close`.
 - Swift требуется для работы с изображениями на macOS.
 
 
-## Security bounds
+## Ограничения и защита
 
-- Clipboard image bytes: максимум 100 MiB.
-- Decoded image dimensions: максимум 100 000 000 пикселей.
-- Swift reader на macOS проверяет размер данных до записи temp-файла.
-- Имена PNG создаются атомарно через \`os.CreateTemp\`; предсказуемых timestamp-имён нет.
+- Размер текста/изображения буфера обмена не превышает 100 MiB; сканирование выделения — не более 4 Mi посещённых ячеек.
+- PNG ограничен 25 000 000 пикселями до полного декодирования.
+- Swift-reader macOS проверяет размер данных до записи temp-файла.
+- PNG temp-файл создаётся атомарно через \`os.CreateTemp\` с правами `0600`; предсказуемых имён и общей фиксированной директории нет.
 
+## Ограничения subprocess и очистка
 
-## Subprocess bounds and cleanup
+- Clipboard-команды завершаются по timeout через 5 секунд.
+- stdout читается через \`io.LimitReader\` и ограничен 100 MiB до неограниченного выделения памяти; при превышении команда отменяется.
+- PTY generation сохраняется до чтения системного clipboard и повторно проверяется перед записью. Задержанная вставка не попадёт в перезапущенную сессию.
+- Пути изображений, переданные child, отслеживаются Emulator и удаляются при \`Close\`/\`Stop\`; устаревшие или неудачные вставки удаляют файл сразу.
+- Clipboard-ошибки передаются как \`ClipboardErrorMsg\` и доступны host через \`Emulator.OnError\`.
 
-- External clipboard readers run with a 5-second context timeout.
-- stdout is read through \`io.LimitReader\` and capped at 100 MiB before an
-  unbounded allocation can occur; oversized commands are cancelled promptly.
-- Paste captures PTY generation before starting the OS clipboard operation and
-  revalidates the exact PTY/generation before writing. A delayed paste can
-  never land in a restarted session.
-- Image paths successfully handed to the child are tracked by Emulator and
-  removed by \`Close\`/\`Stop\`; stale/failed pastes delete their temp file
-  immediately.
-- Clipboard failures are surfaced as \`ClipboardErrorMsg\` and can reach the
-  host through \`Emulator.OnError\`.
+## Живые macOS-тесты
+
+Тесты, которые обращаются к системному pasteboard, пропускаются по умолчанию.
+Для явного запуска требуется `PORTALIS_RUN_CLIPBOARD_INTEGRATION=1`; они заменяют
+содержимое системного буфера и не обещают восстановить предыдущее. Тестовый PNG
+создаётся в `t.TempDir`, а не ищется среди пользовательских файлов в `/tmp`.

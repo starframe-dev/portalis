@@ -62,6 +62,26 @@ func TestParserNewline(t *testing.T) {
 	}
 }
 
+func TestColonSeparatedSGRColors(t *testing.T) {
+	s := NewScreen(1, 8)
+	p := NewParser(s)
+	p.Feed([]byte("\x1b[38:2::12:34:56;48:5:196mA"))
+	p.Feed([]byte("\x1b[38:2:1:2:3;48:2:0:4:5:6mB"))
+
+	if got := s.Cells[0][0].FG; got != lipgloss.Color("#0c2238") {
+		t.Fatalf("colon RGB foreground = %q, want #0c2238", got)
+	}
+	if got := s.Cells[0][0].BG; got != lipgloss.Color("#ff0000") {
+		t.Fatalf("colon 256-color background = %q, want #ff0000", got)
+	}
+	if got := s.Cells[0][1].FG; got != lipgloss.Color("#010203") {
+		t.Fatalf("colon RGB without colorspace foreground = %q, want #010203", got)
+	}
+	if got := s.Cells[0][1].BG; got != lipgloss.Color("#040506") {
+		t.Fatalf("colon RGB colorspace background = %q, want #040506", got)
+	}
+}
+
 func TestAnsi256Color(t *testing.T) {
 	c := ansi256Color(9)
 	if c != lipgloss.Color("#ff0000") {
@@ -300,9 +320,35 @@ func TestParserMousePrivateModes(t *testing.T) {
 	}
 }
 
+func TestAltScreenRestoresCharset(t *testing.T) {
+	s := NewScreen(2, 8)
+	p := NewParser(s)
+	p.Feed([]byte("\x1b(B\x1b[?1049h\x1b(0\x1b[?1049lq"))
+	if got := s.LineText(0); got != "q" {
+		t.Fatalf("charset after leaving alt screen rendered %q, want ASCII q", got)
+	}
+}
+
 func TestOSC7PercentDecodedAndControlsRejected(t *testing.T) {
 	if got := extractOSC7Path("file://localhost/tmp/a%20b"); got != "/tmp/a b" {
 		t.Fatalf("decoded OSC 7 path = %q, want /tmp/a b", got)
+	}
+	if got := extractOSC7Path("file:///tmp/a%20b"); got != "/tmp/a b" {
+		t.Fatalf("decoded hostless OSC 7 path = %q, want /tmp/a b", got)
+	}
+	if got := extractOSC7Path("file://127.0.0.1/tmp/local"); got != "/tmp/local" {
+		t.Fatalf("loopback OSC 7 path = %q, want /tmp/local", got)
+	}
+	for _, uri := range []string{
+		"file://portalis-remote.invalid/tmp/remote",
+		"file://user@localhost/tmp/userinfo",
+		"file://localhost:22/tmp/port",
+		"file://localhost/tmp/path?query",
+		"file://localhost/tmp/path#fragment",
+	} {
+		if got := extractOSC7Path(uri); got != "" {
+			t.Errorf("non-local or non-path OSC 7 URI %q accepted as %q", uri, got)
+		}
 	}
 	if got := extractOSC7Path("file://localhost/tmp/bad%1Bname"); got != "" {
 		t.Fatalf("OSC 7 control path accepted: %q", got)
@@ -322,11 +368,11 @@ func TestDSRRepliesUseActualCursorAndSurviveSplitCSI(t *testing.T) {
 		replies = append(replies, string(data))
 	})
 
-	p.Feed([]byte("["))
+	p.Feed([]byte("\x1b["))
 	p.Feed([]byte("6n"))
-	p.Feed([]byte("[5n"))
+	p.Feed([]byte("\x1b[5n"))
 
-	want := []string{"[3;5R", "[0n"}
+	want := []string{"\x1b[3;5R", "\x1b[0n"}
 	if len(replies) != len(want) {
 		t.Fatalf("DSR replies = %#v, want %#v", replies, want)
 	}
@@ -343,8 +389,8 @@ func TestDeviceAttributesReplies(t *testing.T) {
 	var replies []string
 	p.SetResponseCallback(func(data []byte) { replies = append(replies, string(data)) })
 
-	p.Feed([]byte("[c[>c"))
-	want := []string{"[?1;2c", "[>0;1;0c"}
+	p.Feed([]byte("\x1b[c\x1b[>c"))
+	want := []string{"\x1b[?1;2c", "\x1b[>0;1;0c"}
 	if len(replies) != len(want) || replies[0] != want[0] || replies[1] != want[1] {
 		t.Fatalf("DA replies = %#v, want %#v", replies, want)
 	}
@@ -353,7 +399,7 @@ func TestDeviceAttributesReplies(t *testing.T) {
 func TestBracketedPasteMarkersInOutputDoNotEnterPasteState(t *testing.T) {
 	s := NewScreen(2, 20)
 	p := NewParser(s)
-	p.Feed([]byte("[200~é[201~X"))
+	p.Feed([]byte("\x1b[200~é\x1b[201~X"))
 	if got := s.LineText(0); got != "éX" {
 		t.Fatalf("output around bracketed-paste markers = %q, want éX", got)
 	}
@@ -381,7 +427,7 @@ func TestStringControlsAreIgnoredUntilST(t *testing.T) {
 func TestED2ClearsWithoutHomingCursor(t *testing.T) {
 	s := NewScreen(4, 10)
 	p := NewParser(s)
-	p.Feed([]byte("[3;5Hhello[2J"))
+	p.Feed([]byte("\x1b[3;5Hhello\x1b[2J"))
 	row, col := s.CursorPos()
 	if row != 2 || col != 9 {
 		t.Fatalf("cursor after ED2 = %d,%d, want 2,9", row, col)
@@ -394,11 +440,11 @@ func TestED2ClearsWithoutHomingCursor(t *testing.T) {
 func TestOriginModeMakesCUPRelativeToScrollRegion(t *testing.T) {
 	s := NewScreen(6, 10)
 	p := NewParser(s)
-	p.Feed([]byte("[2;5r[?6h[1;1H"))
+	p.Feed([]byte("\x1b[2;5r\x1b[?6h\x1b[1;1H"))
 	if row, col := s.CursorPos(); row != 1 || col != 0 {
 		t.Fatalf("origin-mode CUP = %d,%d, want 1,0", row, col)
 	}
-	p.Feed([]byte("[?6l"))
+	p.Feed([]byte("\x1b[?6l"))
 	if row, col := s.CursorPos(); row != 0 || col != 0 {
 		t.Fatalf("DECOM reset cursor = %d,%d, want 0,0", row, col)
 	}
@@ -407,7 +453,7 @@ func TestOriginModeMakesCUPRelativeToScrollRegion(t *testing.T) {
 func TestAutoWrapModeCanBeDisabled(t *testing.T) {
 	s := NewScreen(1, 3)
 	p := NewParser(s)
-	p.Feed([]byte("[?7lABCD"))
+	p.Feed([]byte("\x1b[?7lABCD"))
 	if got := s.RenderLine(0); got != "ABD" {
 		t.Fatalf("DECAWM-off line = %q, want ABD", got)
 	}
@@ -419,7 +465,7 @@ func TestAutoWrapModeCanBeDisabled(t *testing.T) {
 func TestREPRepeatsPreviousGraphicCharacter(t *testing.T) {
 	s := NewScreen(1, 10)
 	p := NewParser(s)
-	p.Feed([]byte("A[3b"))
+	p.Feed([]byte("A\x1b[3b"))
 	if got := s.LineText(0); got != "AAAA" {
 		t.Fatalf("REP result = %q, want AAAA", got)
 	}
@@ -428,9 +474,9 @@ func TestREPRepeatsPreviousGraphicCharacter(t *testing.T) {
 func TestDECSCRestoresRenditionAndCharset(t *testing.T) {
 	s := NewScreen(2, 10)
 	p := NewParser(s)
-	p.Feed([]byte("[31m(07"))
-	p.Feed([]byte("[0m(B[2;5H"))
-	p.Feed([]byte("8q"))
+	p.Feed([]byte("\x1b[31m\x1b(0\x1b7"))
+	p.Feed([]byte("\x1b[0m\x1b(B\x1b[2;5H"))
+	p.Feed([]byte("\x1b8q"))
 
 	if got := s.Cells[0][0].Rune; got != '─' {
 		t.Fatalf("restored DEC charset rendered %q, want line drawing", got)

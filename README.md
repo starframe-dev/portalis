@@ -16,8 +16,9 @@ and forwards keyboard, mouse and resize events.
 - OSC 7 working-directory tracking with callbacks
 - System clipboard selection and explicit paste integration (macOS, Wayland, X11)
 - Synchronized output (`CSI ? 2026 h/l`)
-- Selection with mouse drag, scrollback up to 10 000 lines
-- Alt screen, bracketed paste, command history
+- Mouse-drag selection, DEC mouse reporting, focus reporting, and host-driven cursor blinking
+- Scrollback capped at 10 000 lines and 1 048 576 cells; alternate screen and bracketed paste
+- Command history capped at 1 000 entries
 - Render dirty-cache and ordered 4 KiB PTY reads for responsive streaming
 - Framework-agnostic core: feed events, call `View(w, h)` to render
 
@@ -75,7 +76,12 @@ func (m *model) View() string {
 }
 
 func main() {
-    if _, err := tea.NewProgram(newModel(), tea.WithAltScreen()).Run(); err != nil {
+    if _, err := tea.NewProgram(
+        newModel(),
+        tea.WithAltScreen(),
+        tea.WithMouseCellMotion(),
+        tea.WithReportFocus(),
+    ).Run(); err != nil {
         log.Fatal(err)
     }
 }
@@ -84,7 +90,22 @@ func main() {
 The returned commands produce `PtyReadyMsg`, `PtyOutputMsg`,
 `PtyExitMsg`, clipboard errors, and other internal messages; route those
 messages back through `Emulator.Update`. System clipboard paste is explicit
-via `PasteFromClipboard()`; ordinary `Ctrl+V` is forwarded to the child.
+via `PasteFromClipboard()`; ordinary `Ctrl+V` is forwarded to the child. The
+Quick Start enables mouse-cell motion for drag selection and focus messages for
+child focus reporting. Portalis does not create a cursor timer: a host that wants
+blinking should broadcast `portalis.CursorBlinkMsg{}` from one shared timer.
+
+## Resource limits and diagnostics
+
+- A terminal grid is limited to 262 144 cells; scrollback has a separate
+  1 048 576-cell cap, even if its line-count limit is disabled.
+- Clipboard subprocesses time out after 5 seconds. Clipboard text/image data is
+  capped at 100 MiB; decoded PNGs are capped at 25 million pixels.
+- PTY writes are serialized through a bounded queue (64 requests / 100 MiB).
+- Setting `PORTALIS_RAW_TRACE=<base>` writes `<base>.<pid>` and a `.chunks`
+  sidecar with mode `0600`. Traces include child output, may contain secrets,
+  and grow without a size limit; enable only for diagnostics and remove them
+  after use.
 
 ## Architecture
 
@@ -118,11 +139,21 @@ Project specs live under `specs/` and per-file specs under `code-specs/`:
 ```bash
 go test ./...
 go test -race ./...
+go vet ./...
+staticcheck ./...
+govulncheck ./...
+go test -run=^$ -fuzz=FuzzParserFeed -fuzztime=5s .
 ```
 
-Unit tests cover ANSI sequences, screen operations, key encoding, and PTY resize/ordered reads. Visual E2E with `tmux` is run via `cuetty-cli` (see `cuetty-artifacts/portalis-tmux/`).
-
-Note: `clipboard_mac_test.go` runs only on macOS; other tests are portable.
+CI also runs a Linux PTY lifecycle smoke test and Linux/ARM64 cross-compilation.
+For visual TUI integration, install `cuetty-cli` and run
+`go test -tags cuetty -run '^TestANSIStressCueTTY$' .`; it regenerates the
+ignored `cuetty-artifacts/ansi-stress/` outputs. See
+[`specs/ansi-stress-cue-tty.md`](specs/ansi-stress-cue-tty.md). The live Pi test
+requires an authenticated Pi installation and is intentionally not part of CI.
+`clipboard_mac_test.go` live tests are macOS-only and skipped by default. They replace
+the system clipboard; run them only explicitly with
+`PORTALIS_RUN_CLIPBOARD_INTEGRATION=1`. Other unit tests are portable.
 
 ## License
 

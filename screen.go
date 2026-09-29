@@ -39,7 +39,16 @@ func (c Cell) Empty() bool {
 	return !c.Continuation && (c.Rune == 0 || c.Rune == ' ')
 }
 
-// Screen is a 2D grid of cells.
+type screenRenderState struct {
+	lines         [][]Cell
+	contentRows   []int
+	cols          int
+	cursor        Cursor
+	cursorVisible bool
+}
+
+// Screen is a 2D grid of cells. It is not safe for concurrent use; callers
+// that share a Screen must serialize access to its methods and exported fields.
 type Screen struct {
 	Rows   int
 	Cols   int
@@ -64,12 +73,14 @@ type Screen struct {
 	autoWrap                bool
 
 	scrollback      [][]Cell // lines scrolled off the top
+	scrollbackCells int
 	scrollbackLimit int
 	viewOffset      int // lines scrolled back in the view
 
-	syncActive  bool   // true during synchronized output (ESC[?2026h)
-	lastRender  string // last committed render while sync is active
-	renderDirty bool
+	syncActive     bool   // true during synchronized output (ESC[?2026h)
+	lastRender     string // last committed render while sync is active
+	renderDirty    bool
+	committedFrame *screenRenderState
 
 	applicationCursor  bool
 	bracketedPaste     bool
@@ -175,13 +186,22 @@ func (s *Screen) cellInSelection(row, col int) bool {
 	return true
 }
 
-// SelectionText returns the text currently highlighted by the selection,
-// with each line as one string in the slice. Trailing whitespace trimmed.
-// When dragging left on a single row, the column under the mouse (the
-// lower col index) is excluded.
+// SelectionText returns the selected text. It returns nil when the selection
+// exceeds clipboard resource limits; trailing whitespace is trimmed.
 func (s *Screen) SelectionText() []string {
-	if !s.selectionActive {
+	lines, err := s.selectionTextWithLimit(maxClipboardBytes, maxClipboardCells)
+	if err != nil {
 		return nil
+	}
+	return lines
+}
+
+func (s *Screen) selectionTextWithLimit(maxBytes, maxCells int) ([]string, error) {
+	if !s.selectionActive {
+		return nil, nil
+	}
+	if maxBytes < 0 || maxCells < 0 {
+		return nil, fmt.Errorf("selection limits must be non-negative")
 	}
 	aRow, aCol := s.selStartRow, s.selStartCol
 	cRow, cCol := s.selEndRow, s.selEndCol
@@ -199,26 +219,36 @@ func (s *Screen) SelectionText() []string {
 		r2 = s.Rows - 1
 	}
 	if r1 > r2 {
-		return nil
+		return nil, nil
 	}
+
 	var out []string
-	for r := r1; r <= r2; r++ {
-		start := 0
-		end := s.Cols - 1
-		if r == r1 {
+	totalBytes, totalCells := 0, 0
+	for row := r1; row <= r2; row++ {
+		if len(out) > 0 {
+			if totalBytes == maxBytes {
+				return nil, fmt.Errorf("selection exceeds %d bytes", maxBytes)
+			}
+			totalBytes++
+		}
+		start, end := 0, s.Cols-1
+		if row == r1 {
 			start = c1
 			if exclusiveStart {
-				start = c1 + 1
+				start++
 			}
 		}
-		if r == r2 {
+		if row == r2 {
 			end = c2
 		}
 		if start > end {
 			out = append(out, "")
 			continue
 		}
-		cells := s.contentRowCells(r)
+		cells := s.contentRowCells(row)
+		if start < len(cells) && start > 0 && cells[start].Continuation && cellDisplayWidth(cells[start-1]) == 2 {
+			start--
+		}
 		if start >= len(cells) {
 			out = append(out, "")
 			continue
@@ -226,22 +256,40 @@ func (s *Screen) SelectionText() []string {
 		if end >= len(cells) {
 			end = len(cells) - 1
 		}
-		var b strings.Builder
-		for c := start; c <= end; c++ {
-			cell := cells[c]
+
+		var line strings.Builder
+		pendingSpaces := 0
+		for col := start; col <= end; col++ {
+			if totalCells >= maxCells {
+				return nil, fmt.Errorf("selection exceeds %d cells", maxCells)
+			}
+			totalCells++
+			cell := cells[col]
 			if cell.Continuation {
 				continue
 			}
-			if cell.Rune == 0 {
-				b.WriteByte(' ')
+			if cell.Rune == 0 || (cell.Rune == ' ' && cell.Combining == "") {
+				pendingSpaces++
 				continue
 			}
-			b.WriteRune(cell.Rune)
-			b.WriteString(cell.Combining)
+			if pendingSpaces > maxBytes-totalBytes {
+				return nil, fmt.Errorf("selection exceeds %d bytes", maxBytes)
+			}
+			if pendingSpaces > 0 {
+				line.WriteString(strings.Repeat(" ", pendingSpaces))
+				totalBytes += pendingSpaces
+				pendingSpaces = 0
+			}
+			text := string(cell.Rune) + cell.Combining
+			if len(text) > maxBytes-totalBytes {
+				return nil, fmt.Errorf("selection exceeds %d bytes", maxBytes)
+			}
+			line.WriteString(text)
+			totalBytes += len(text)
 		}
-		out = append(out, strings.TrimRight(b.String(), " "))
+		out = append(out, line.String())
 	}
-	return out
+	return out, nil
 }
 
 // contentRowCells returns cells for a logical row. Negative rows address the
@@ -273,11 +321,14 @@ type Cursor struct {
 // memory growth for long-running sessions.
 const (
 	defaultScrollbackLimit = 10000
+	maxScrollbackCells     = 1 << 20
 	maxGraphemeBytes       = 4096
 )
 
-// NewScreen creates a new screen with the given dimensions.
-// Scrollback is capped to defaultScrollbackLimit lines by default.
+// NewScreen creates a screen with the requested dimensions. Non-positive
+// dimensions are normalized to one cell; dimensions beyond the terminal memory
+// budget fall back to the conventional 24x80 size. Scrollback is capped to
+// defaultScrollbackLimit lines by default.
 func NewScreen(rows, cols int) *Screen {
 	if rows < 1 {
 		rows = 1
@@ -285,6 +336,13 @@ func NewScreen(rows, cols int) *Screen {
 	if cols < 1 {
 		cols = 1
 	}
+	if err := validateTerminalSize(rows, cols); err != nil {
+		rows, cols = defaultTerminalRows, defaultTerminalCols
+	}
+	return newScreen(rows, cols)
+}
+
+func newScreen(rows, cols int) *Screen {
 	s := &Screen{
 		Rows:            rows,
 		Cols:            cols,
@@ -298,18 +356,13 @@ func NewScreen(rows, cols int) *Screen {
 	return s
 }
 
-// SetScrollbackLimit sets the maximum number of scrollback lines. A value
-// of zero or less disables the limit (not recommended for long-running
-// sessions).
+// SetScrollbackLimit sets the maximum number of retained lines. A value of
+// zero or less disables this line-count limit; the cell-count safety cap still
+// applies.
 func (s *Screen) SetScrollbackLimit(limit int) {
 	s.markDirty()
 	s.scrollbackLimit = limit
-	if limit > 0 && len(s.scrollback) > limit {
-		s.scrollback = s.scrollback[len(s.scrollback)-limit:]
-	}
-	if s.viewOffset > len(s.scrollback) {
-		s.viewOffset = len(s.scrollback)
-	}
+	s.enforceScrollbackLimits(maxScrollbackCells)
 }
 
 func resizeCellGrid(old [][]Cell, rows, cols int) [][]Cell {
@@ -321,6 +374,125 @@ func resizeCellGrid(old [][]Cell, rows, cols int) [][]Cell {
 		}
 	}
 	return grid
+}
+
+func resizeCellGridWithTrim(old [][]Cell, rows, cols, cursorRow int) ([][]Cell, int, [][]Cell) {
+	if len(old) <= rows {
+		return resizeCellGrid(old, rows, cols), 0, nil
+	}
+	trimTop := len(old) - rows
+	if cursorRow < 0 {
+		cursorRow = 0
+	}
+	if cursorRow < trimTop {
+		trimTop = cursorRow
+	}
+	removed := resizeCellGrid(old[:trimTop], trimTop, cols)
+	kept := resizeCellGrid(old[trimTop:trimTop+rows], rows, cols)
+	return kept, trimTop, removed
+}
+
+func (s *Screen) appendResizedScrollback(rows [][]Cell) {
+	for _, row := range rows {
+		s.appendScrollbackLine(row)
+	}
+}
+
+func (s *Screen) appendScrollbackLine(cells []Cell) {
+	s.appendScrollbackLineWithLimit(cells, maxScrollbackCells)
+}
+
+func (s *Screen) appendScrollbackLineWithLimit(cells []Cell, cellLimit int) {
+	rowCells := len(cells)
+	if rowCells == 0 || cellLimit <= 0 || rowCells > cellLimit {
+		return
+	}
+	maxRows := cellLimit / rowCells
+	if s.scrollbackLimit > 0 && s.scrollbackLimit < maxRows {
+		maxRows = s.scrollbackLimit
+	}
+	if s.viewOffset > 0 {
+		s.viewOffset++
+	}
+	var reusable []Cell
+	for len(s.scrollback) >= maxRows || s.scrollbackCells > cellLimit-rowCells {
+		if len(s.scrollback) == 0 {
+			s.scrollbackCells = 0
+			break
+		}
+		oldest := s.scrollback[0]
+		s.scrollback = s.scrollback[1:]
+		s.scrollbackCells -= len(oldest)
+		if s.scrollbackCells < 0 {
+			s.scrollbackCells = 0
+		}
+		if reusable == nil && len(oldest) == rowCells {
+			reusable = oldest
+		}
+	}
+	line := reusable
+	if line == nil {
+		line = make([]Cell, rowCells)
+	}
+	copy(line, cells)
+	s.scrollback = append(s.scrollback, line)
+	s.scrollbackCells += rowCells
+	if s.viewOffset > len(s.scrollback) {
+		s.viewOffset = len(s.scrollback)
+	}
+}
+
+func (s *Screen) enforceScrollbackLimits(cellLimit int) {
+	for len(s.scrollback) > 0 && ((s.scrollbackLimit > 0 && len(s.scrollback) > s.scrollbackLimit) || s.scrollbackCells > cellLimit) {
+		s.scrollbackCells -= len(s.scrollback[0])
+		s.scrollback = s.scrollback[1:]
+	}
+	if s.scrollbackCells < 0 {
+		s.scrollbackCells = 0
+	}
+	if s.viewOffset > len(s.scrollback) {
+		s.viewOffset = len(s.scrollback)
+	}
+}
+
+func resizedScrollRegion(top, bottom, oldRows, newRows, trimTop int) (int, int) {
+	if top == 0 && bottom == oldRows-1 {
+		return 0, newRows - 1
+	}
+	top -= trimTop
+	bottom -= trimTop
+	if top < 0 {
+		top = 0
+	}
+	if bottom < 0 {
+		bottom = 0
+	}
+	if top >= newRows {
+		top = newRows - 1
+	}
+	if bottom >= newRows {
+		bottom = newRows - 1
+	}
+	if bottom <= top {
+		return 0, newRows - 1
+	}
+	return top, bottom
+}
+
+func clampCursorToSize(cursor Cursor, rows, cols int) Cursor {
+	if cursor.Row < 0 {
+		cursor.Row = 0
+	}
+	if cursor.Row >= rows {
+		cursor.Row = rows - 1
+	}
+	if cursor.Col < 0 {
+		cursor.Col = 0
+	}
+	if cursor.Col >= cols {
+		cursor.Col = cols - 1
+	}
+	return cursor
 }
 
 func sanitizeCellRow(cells []Cell) {
@@ -342,13 +514,26 @@ func sanitizeCellRow(cells []Cell) {
 
 func (s *Screen) resize(rows, cols int) {
 	s.markDirty()
-	s.Cells = resizeCellGrid(s.Cells, rows, cols)
+	oldRows := s.Rows
+	activeCells, activeTrim, activeRemoved := resizeCellGridWithTrim(s.Cells, rows, cols, s.Cursor.Row)
+	activeTop, activeBottom := resizedScrollRegion(s.scrollTop, s.scrollBottom, oldRows, rows, activeTrim)
 	if s.savedCells != nil {
-		s.savedCells = resizeCellGrid(s.savedCells, rows, cols)
+		savedCells, savedTrim, savedRemoved := resizeCellGridWithTrim(s.savedCells, rows, cols, s.altSavedCursor.Row)
+		s.savedCells = savedCells
+		s.appendResizedScrollback(savedRemoved)
 		for row := range s.savedCells {
 			sanitizeCellRow(s.savedCells[row])
 		}
+		s.altSavedScrollTop, s.altSavedScrollBottom = resizedScrollRegion(
+			s.altSavedScrollTop, s.altSavedScrollBottom, oldRows, rows, savedTrim,
+		)
+		s.altSavedCursor.Row -= savedTrim
+		s.altSavedCursor = clampCursorToSize(s.altSavedCursor, rows, cols)
+	} else {
+		s.appendResizedScrollback(activeRemoved)
 	}
+	s.Cells = activeCells
+	s.Cursor.Row -= activeTrim
 	s.Rows = rows
 	s.Cols = cols
 	for row := range s.Cells {
@@ -360,11 +545,8 @@ func (s *Screen) resize(rows, cols int) {
 	// and the visible scrollback gets clipped on the right (or padded with
 	// garbage when shrunk).
 	s.normalizeScrollback()
-	// Reset scroll region to the full screen on resize; this matches the
-	// behaviour of most terminal emulators and prevents stale margins from
-	// leaving unused blank lines after the terminal grows.
-	s.scrollTop = 0
-	s.scrollBottom = rows - 1
+	s.scrollTop = activeTop
+	s.scrollBottom = activeBottom
 
 	// Clamp viewOffset: the scrollback may have shrunk, so the previous
 	// offset can now point past the end of the buffer.
@@ -385,6 +567,7 @@ func (s *Screen) normalizeScrollback() {
 	if s.Cols <= 0 {
 		return
 	}
+	s.scrollbackCells = 0
 	for i := range s.scrollback {
 		line := s.scrollback[i]
 		switch {
@@ -406,27 +589,28 @@ func (s *Screen) normalizeScrollback() {
 		// Remove both dangling continuation cells and wide base cells whose
 		// continuation was truncated at the new right edge.
 		sanitizeCellRow(s.scrollback[i])
+		s.scrollbackCells += len(s.scrollback[i])
 	}
+	s.enforceScrollbackLimits(maxScrollbackCells)
 }
 
-// Resize resizes the screen, preserving existing content.
+// Resize resizes the screen when dimensions are valid. Invalid dimensions
+// leave the screen unchanged; use ResizeChecked to retrieve the validation error.
 func (s *Screen) Resize(rows, cols int) {
-	if rows < 1 {
-		rows = 1
-	}
-	if cols < 1 {
-		cols = 1
+	_ = s.ResizeChecked(rows, cols)
+}
+
+// ResizeChecked resizes the screen or returns an error before changing it.
+func (s *Screen) ResizeChecked(rows, cols int) error {
+	if err := validateTerminalSize(rows, cols); err != nil {
+		return err
 	}
 	if rows == s.Rows && cols == s.Cols {
-		return
+		return nil
 	}
 	s.resize(rows, cols)
-	if s.Cursor.Row >= rows {
-		s.Cursor.Row = rows - 1
-	}
-	if s.Cursor.Col >= cols {
-		s.Cursor.Col = cols - 1
-	}
+	s.Cursor = clampCursorToSize(s.Cursor, rows, cols)
+	return nil
 }
 
 // Clear clears the entire screen.
@@ -563,11 +747,22 @@ func cellDisplayWidth(cell Cell) int {
 	if cell.Continuation || cell.Rune == 0 {
 		return 0
 	}
-	w := uniseg.StringWidth(cellText(cell))
-	if w > 2 {
-		w = 2
+	return graphemeDisplayWidth(cellText(cell))
+}
+
+func graphemeDisplayWidth(text string) int {
+	if len(text) > 0 {
+		base, _ := utf8.DecodeRuneInString(text)
+		isKeycapBase := base >= '0' && base <= '9' || base == '#' || base == '*'
+		if isKeycapBase && strings.ContainsRune(text, '\u20e3') {
+			return 2
+		}
 	}
-	return w
+	width := uniseg.StringWidth(text)
+	if width > 2 {
+		return 2
+	}
+	return width
 }
 
 // isGraphemeExtender reports whether r is a character that extends the previous
@@ -626,14 +821,8 @@ func graphemeBreak(prev string, r rune) bool {
 // Like ghostty's graphemeWidthEffect: wide, narrow, no_change, ignore.
 // Returns (oldWidth, newWidth). If oldWidth == newWidth, effect is no_change.
 func graphemeWidthEffect(prev string, r rune) (oldWidth, newWidth int) {
-	oldWidth = uniseg.StringWidth(prev)
-	if oldWidth > 2 {
-		oldWidth = 2
-	}
-	newWidth = uniseg.StringWidth(prev + string(r))
-	if newWidth > 2 {
-		newWidth = 2
-	}
+	oldWidth = graphemeDisplayWidth(prev)
+	newWidth = graphemeDisplayWidth(prev + string(r))
 	return oldWidth, newWidth
 }
 
@@ -670,10 +859,30 @@ func (s *Screen) appendToPreviousCluster(r rune) bool {
 	// Apply width change before appending so the cell state is consistent
 	// when we adjust the cursor.
 	if oldWidth == 1 && newWidth == 2 {
-		// wide: set continuation cell
 		if col+1 >= s.Cols {
-			// Can't widen at the right edge; ignore
-			return false
+			if s.Cols < 2 || !s.autoWrap || !s.wrapPending || col != s.Cols-1 || s.Rows <= 1 ||
+				(s.Cursor.Row == s.Rows-1 && s.Cursor.Row != s.scrollBottom) ||
+				(s.Cursor.Row == s.scrollBottom && s.scrollBottom <= s.scrollTop) {
+				return false
+			}
+			relocated := *cell
+			relocated.Combining += string(r)
+			s.clearCellFootprint(row, col)
+			s.wrapPending = false
+			s.Cursor.Col = 0
+			s.Index()
+			targetRow := s.Cursor.Row
+			s.clearCellFootprint(targetRow, 0)
+			s.Cells[targetRow][0] = relocated
+			s.Cells[targetRow][1] = Cell{Continuation: true}
+			if s.Cols == 2 {
+				s.Cursor.Col = 1
+				s.wrapPending = true
+			} else {
+				s.Cursor.Col = 2
+			}
+			s.selectionActive = false
+			return true
 		}
 		s.clearCellFootprint(row, col+1)
 		s.Cells[row][col+1] = Cell{Continuation: true}
@@ -710,14 +919,15 @@ func (s *Screen) Put(r rune) {
 
 	width := uniseg.StringWidth(string(r))
 	if width <= 0 {
-		// Zero-width (combining): try to append to previous cluster.
-		// Must be called AFTER wrap check so that wrapPending doesn't
-		// confuse previousBaseCell's column calculation.
+		// Extend the previous grapheme before resolving a pending wrap.
 		s.appendToPreviousCluster(r)
 		return
 	}
 	if width > 2 {
 		width = 2
+	}
+	if s.autoWrap && s.appendToPreviousCluster(r) {
+		return
 	}
 	if width == 2 && s.Cols < 2 {
 		r = '�'
@@ -999,17 +1209,7 @@ func (s *Screen) scrollLineUp() {
 		s.selectionActive = false
 	}
 	if top == 0 && !s.altScreen {
-		if s.scrollbackLimit > 0 && len(s.scrollback) >= s.scrollbackLimit {
-			// Reuse the oldest scrollback line to avoid allocating a new slice.
-			line := s.scrollback[0]
-			s.scrollback = s.scrollback[1:]
-			copy(line, s.Cells[0])
-			s.scrollback = append(s.scrollback, line)
-		} else {
-			line := make([]Cell, s.Cols)
-			copy(line, s.Cells[0])
-			s.scrollback = append(s.scrollback, line)
-		}
+		s.appendScrollbackLine(s.Cells[0])
 	}
 	for r := top + 1; r <= bottom; r++ {
 		copy(s.Cells[r-1], s.Cells[r])
@@ -1327,6 +1527,7 @@ func (s *Screen) ClearScrollback() {
 	}
 	s.markDirty()
 	s.scrollback = nil
+	s.scrollbackCells = 0
 	s.viewOffset = 0
 	s.selectionActive = false
 }
@@ -1380,10 +1581,6 @@ func (s *Screen) mouseTrackingMode() int {
 	return 0
 }
 
-func (s *Screen) mouseReportingEnabled() bool {
-	return s.mouseTrackingMode() != 0
-}
-
 // SetSync enables or disables synchronized output (ESC[?2026h/l).
 // While synchronized output is active, Render() returns the last committed
 // frame so intermediate redraw states are not visible.
@@ -1398,6 +1595,9 @@ func (s *Screen) SetSync(active bool) {
 			s.lastRender = s.renderToString()
 			s.renderDirty = false
 		}
+		if s.committedFrame == nil {
+			s.committedFrame = s.captureRenderState()
+		}
 		s.syncActive = true
 		return
 	}
@@ -1410,24 +1610,77 @@ func (s *Screen) SetSync(active bool) {
 }
 
 func (s *Screen) markDirty() {
+	if !s.renderDirty && !s.syncActive && s.lastRender != "" {
+		s.committedFrame = s.captureRenderState()
+	}
 	s.renderDirty = true
+}
+
+func (s *Screen) captureRenderState() *screenRenderState {
+	viewOffset := s.viewOffset
+	if viewOffset > len(s.scrollback) {
+		viewOffset = len(s.scrollback)
+	}
+	frame := &screenRenderState{
+		lines:         make([][]Cell, 0, s.Rows),
+		contentRows:   make([]int, 0, s.Rows),
+		cols:          s.Cols,
+		cursor:        s.Cursor,
+		cursorVisible: viewOffset == 0 && s.CursorVisible && s.CursorBlinkVisible,
+	}
+	for viewportRow := 0; viewportRow < s.Rows; viewportRow++ {
+		contentRow := viewportRow - viewOffset
+		var cells []Cell
+		if contentRow < 0 {
+			scrollbackRow := len(s.scrollback) + contentRow
+			if scrollbackRow >= 0 && scrollbackRow < len(s.scrollback) {
+				cells = s.scrollback[scrollbackRow]
+			}
+		} else if contentRow < len(s.Cells) {
+			cells = s.Cells[contentRow]
+		}
+		frame.lines = append(frame.lines, append([]Cell(nil), cells...))
+		frame.contentRows = append(frame.contentRows, contentRow)
+	}
+	return frame
+}
+
+func (s *Screen) renderCommittedWithSelection() string {
+	frame := s.committedFrame
+	if frame == nil {
+		return s.lastRender
+	}
+	liveCursor, liveCols := s.Cursor, s.Cols
+	defer func() {
+		s.Cursor = liveCursor
+		s.Cols = liveCols
+	}()
+	s.Cursor = frame.cursor
+	s.Cols = frame.cols
+	lines := make([]string, len(frame.lines))
+	for viewportRow, cells := range frame.lines {
+		contentRow := frame.contentRows[viewportRow]
+		cursorRow := frame.cursorVisible && contentRow == frame.cursor.Row
+		lines[viewportRow] = s.renderCells(cells, cursorRow, contentRow)
+	}
+	return strings.Join(lines, "\n")
 }
 
 // Render returns the screen as a string. If the view is scrolled back,
 // lines are taken from the scrollback buffer; otherwise the live screen is
 // rendered.
 func (s *Screen) Render() string {
-	// During synchronized output, show the frozen frame unless the user is
-	// actively selecting text. Selection must remain visible even while the
-	// application is batching output, so we bypass the frozen frame and render
-	// the current state (with selection overlay) in that case.
-	if s.syncActive && !s.selectionActive {
-		return s.lastRender
+	if s.syncActive {
+		if !s.selectionActive {
+			return s.lastRender
+		}
+		return s.renderCommittedWithSelection()
 	}
 	if !s.renderDirty && s.lastRender != "" && !s.selectionActive {
 		return s.lastRender
 	}
 	s.lastRender = s.renderToString()
+	s.committedFrame = nil
 	s.renderDirty = false
 	return s.lastRender
 }
@@ -1483,7 +1736,8 @@ func (s *Screen) renderCells(cells []Cell, cursorRow bool, row int) string {
 		}
 		text := string(cell.Rune) + cell.Combining
 
-		cursorHere := cursorRow && c == s.Cursor.Col
+		cursorHere := cursorRow && (c == s.Cursor.Col ||
+			(cellDisplayWidth(cell) == 2 && s.Cursor.Col == c+1))
 		selHere := s.cellInSelection(row, c) ||
 			(c+1 < len(cells) && cells[c+1].Continuation && s.cellInSelection(row, c+1))
 
@@ -1494,7 +1748,15 @@ func (s *Screen) renderCells(cells []Cell, cursorRow bool, row int) string {
 				b.WriteString("\x1b[0m")
 			}
 			b.WriteString("\x1b[7m")
-			b.WriteString(text)
+			overlayText := text
+			if cell.Style&StyleHidden != 0 {
+				width := cellDisplayWidth(cell)
+				if width < 1 {
+					width = 1
+				}
+				overlayText = strings.Repeat(" ", width)
+			}
+			b.WriteString(overlayText)
 			b.WriteString("\x1b[0m")
 			// Re-emit the cell's style for subsequent cells.
 			if cell.FG != "" || cell.BG != "" || cell.Style != 0 {

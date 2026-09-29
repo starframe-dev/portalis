@@ -33,7 +33,7 @@ portalis/
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Emulator implements warp.Panel
+### Emulator — встраиваемый компонент без привязки к host model
 
 ```go
 type Emulator struct {
@@ -51,7 +51,8 @@ type Emulator struct {
     cwd       string          // Последняя рабочая директория
     commandHistory []string      // История команд (max 1000)
     initialCWD string          // Изначальная рабочая директория
-    scrollbackLimit int         // Лимит скролла (по умолчанию 10000)
+    scrollbackLimit int         // Лимит строк (по умолчанию 10000)
+    scrollbackCells int         // Дополнительный cap — 1048576 ячеек
     pressX, pressY int         // Позиция нажатия мыши
     dragSelecting bool        // В процессе ли drag-выбора
     mu        sync.RWMutex   // Мьютекс для синхронизации
@@ -150,21 +151,30 @@ Input Data → Parser.Feed() → CSI/OSC/SGR → Screen.Put() → Render
 
 | Callback | Описание |
 |----------|----------|
-| `OnCWDChange(fn func(string))` | Вызывается при смене рабочей директории |
-| `OnCommandHistoryChanged(fn func([]string))` | Вызывается при изменении истории команд |
+| Поле `OnCWDChange func(string)` | Уведомляет о смене рабочей директории |
+| Поле `OnCommandHistoryChanged func([]string)` | Уведомляет об изменении истории команд |
+| Поле `OnError func(error)` | Передаёт инфраструктурные и clipboard-ошибки host-приложению |
+
+Внешние callbacks вызываются после снятия `Emulator.mu`, поэтому могут повторно
+вызывать методы эмулятора. История ограничена последними 1000 командами; при
+`SetCommandHistory` более старые элементы отбрасываются. Аргументы конструктора,
+`StartEnv()` и восстановленная история копируются, чтобы вызывающий код не мог
+изменять внутренние срезы.
 
 ### Screen
 
 | Метод | Описание |
 |-------|----------|
 | `NewScreen(rows, cols)` | Создание экрана |
+| `Resize(rows, cols)` | Совместимый с прежней сигнатурой resize; недопустимые размеры игнорируются без мутации |
+| `ResizeChecked(rows, cols)` | Изменение размера с возвращением ошибки валидации |
 | `Put(r rune)` | Запись символа |
 | `SetCursor(row, col)` | Установка курсора |
 | `ScrollUp()` / `ScrollViewUp(n)` | Скроллинг вверх |
 | `Clear()`, `ClearLine()`, `ClearLineLeft()` / `ClearLineAll()` | Очистка |
 | `EnterAltScreen()` / `ExitAltScreen()` | Альтернативный экран |
 | `StartSelection(row, col)` / `ExtendSelection(row, col)` / `ClearSelection()` | Выделение |
-| `SelectionText()` | Получение выделенного текста |
+| `SelectionText()` | Получение выделенного текста; при превышении 100 MiB или 4 Mi ячеек возвращает `nil` |
 | `Render()` | Рендеринг экрана |
 
 ### Parser
@@ -185,6 +195,7 @@ Input Data → Parser.Feed() → CSI/OSC/SGR → Screen.Put() → Render
 | `Resize(rows, cols)` | Изменение размера |
 | `Close()` | Закрытие PTY |
 | `Listen(sessionID)` | Слушатель событий |
+| `WriteForGeneration(generation, data)` | Отклонение записи от устаревшего PTY поколения |
 
 ### Clipboard
 
@@ -192,6 +203,7 @@ Input Data → Parser.Feed() → CSI/OSC/SGR → Screen.Put() → Render
 |---------|----------|
 | `copyToClipboard(lines)` | Копирование в буфер обмена |
 | `pasteFromClipboard()` | Вставка из буфера обмена |
+| `(*Emulator).PasteFromClipboard()` | Асинхронная интеграция вставки с PTY и текущим paste mode |
 
 ## Дизайн-решения
 
@@ -216,11 +228,11 @@ Emulator использует Bubble Tea для обработки событи�
 - Generation check и `Parser.Feed` выполняются под одним `Emulator.mu`, чтобы stale PTY chunk не мог попасть в новый terminal state.
 - Parser callbacks только queue'ят CWD/terminal-response state; внешние callbacks и PTY writes выполняются после unlock.
 
-### 3. Scrollback Management
+### 3. Буфер прокрутки
 
-- Scrollback буфер ограничивается `scrollbackLimit` (по умолчанию 10000)
-- При заполнении старые строки удаляются
-- View offset позволяет "прокручивать" scrollback буфер
+- Scrollback ограничен `scrollbackLimit` (по умолчанию 10000 строк) и общим cap в 1048576 ячеек.
+- При достижении любого cap вытесняются самые старые строки; cap ячеек действует и при `SetScrollbackLimit(0)`.
+- `viewOffset` хранит положение просмотра и clamp-ится при изменении/вытеснении буфера.
 
 ### 4. Bracketed Paste
 
@@ -258,13 +270,13 @@ Emulator использует Bubble Tea для обработки событи�
 
 ### 9. Размер PTY и производительность
 
-- `Pty.Resize` применяет каждый размер напрямую через `pty.Setsize`, без потерь из-за throttle.
+- `Pty.Resize` проверяет размеры до `TIOCSWINSZ`, пропускает повторный идентичный размер и обновляет сохранённую геометрию только после успешного ioctl; дополнительный сигнал `SIGWINCH` не отправляется.
 - `Pty.Listen` выдаёт упорядоченные read chunks до 4 KiB и гарантированно дренирует уже прочитанный вывод перед `PtyExitMsg`.
 - `Screen` использует dirty cache: неизменившийся кадр возвращает предыдущий render, инвалидация происходит при любом изменении ячеек/курсора/выделения/режимов.
 
 ## Ограничения
 
-1. **Scrollback limit** — по умолчанию 10000 строк
+1. **Scrollback** — по умолчанию не более 10000 строк и всегда не более 1048576 ячеек
 2. **Command history** — макс 1000 команд
 3. **Cursor** — всегда в пределах границ экрана
 4. **Selection** — работает только когда `selectionActive = true`
@@ -272,11 +284,11 @@ Emulator использует Bubble Tea для обработки событи�
 
 ## Безопасность
 
-1. Все ошибки обрабатываются явно (не игнорируются)
-2. Проверка на закрытый PTY перед операциями
-3. Процесс убивается при закрытии PTY
-4. Временные файлы используют UUID-имена
-5. Изображения перекодируются для чистоты данных
+1. Ошибки запуска, записи и завершения PTY передаются вызывающему коду; ошибки записи необязательного raw trace намеренно игнорируются.
+2. PTY проверяется на закрытие перед операциями; дочерний процесс завершается при закрытии.
+3. Clipboard temp-файлы создаются с правами `0600` и удаляются при `Stop`/`Close` либо сразу при ошибке/устаревшей сессии.
+4. Clipboard subprocess ограничен 5 секундами и выводом 100 MiB; PNG до decode ограничен 25 000 000 пикселями.
+5. Сканирование clipboard selection ограничено 4 Mi ячейками и выводом 100 MiB.
 
 ## Зависимости
 
@@ -286,11 +298,11 @@ Emulator использует Bubble Tea для обработки событи�
 
 ## Примечания
 
-- Код работает только на платформах с соответствующими инструментами
-- Изображения сохраняются во временную директорию и должны быть удалены
-- Swift требуется для работы с изображениями на macOS
-- PTY использует `xterm-256color` терминал
-- Вывод обрабатывается через `bufio.Reader` для корректного разбора
+- PTY поддерживается на Unix-подобных системах Linux и macOS; Windows не поддерживается.
+- Clipboard image-файлы отслеживаются Emulator и удаляются при `Stop`/`Close`.
+- Swift используется для чтения изображений из clipboard macOS.
+- PTY получает `TERM=xterm-256color`, если вызывающий код не переопределил значение.
+- PTY output читается через `bufio.Reader` небольшими упорядоченными chunks.
 
 ## Связанные спецификации
 
@@ -301,27 +313,21 @@ Emulator использует Bubble Tea для обработки событи�
 - `code-specs/clipboard.md` — детальная спецификация Clipboard
 
 
-## Hardening invariants
+## Инварианты hardening
 
-- \`Pty.Close()\` идемпотентен и может закрыть fd, пока другая goroutine заблокирована в \`Write\`.
-- EOF/error публикуется только после всех уже прочитанных PTY chunks.
-- Alternate screen не пишет в основной scrollback; оба screen buffer меняют размер согласованно.
-- Grapheme cluster имеет ограничение размера, чтобы hostile terminal output не создавал неограниченные строки.
-- Mouse events передаются child process только после DECSET 1000/1002/1003; 1006 выбирает SGR encoding. Shift принудительно оставляет mouse event локальному selection/scrollback.
-- Публичные размеры Screen нормализуются минимум к 1×1.
+- \`Pty.Close()\` идемпотентен и закрывает PTY fd, даже если другая goroutine заблокирована в \`Write\`.
+- EOF/ошибка публикуются только после всех уже прочитанных PTY chunks.
+- Alternate screen не пишет в основной scrollback; оба screen buffer согласованно меняют размер.
+- Размер grapheme cluster ограничен, чтобы hostile terminal output не создавал неограниченные строки.
+- Mouse events передаются child process только после DECSET 1000/1002/1003; режим 1006 выбирает SGR encoding. Shift оставляет событие локальной обработке.
+- Публичные размеры Screen нормализуются минимум к 1×1; scrollback дополнительно ограничен 1048576 ячейками.
 
 
-## VT/xterm compatibility hardening (2026-09-28)
+## Совместимость VT/xterm
 
-- DSR/CPR и DA обрабатываются Parser'ом, а не raw PTY chunk scanner'ом, поэтому
-  escape sequences могут пересекать read boundaries.
-- Поддерживаются DECOM \`?6\`, DECAWM \`?7\`, focus tracking \`?1004\`,
-  mouse 1000/1002/1003/1006, REP, BCE и ignored DCS/SOS/PM/APC strings.
-- Bracketed-paste delimiters являются input protocol и не переводят output
-  Parser в специальный paste-state.
-- Alternate screen имеет отдельный saved cursor/scroll region; DECSC/DECRC
-  сохраняют rendition и charset state.
-- PTY spawn выполняется вне Emulator mutex; lifecycle generation отменяет
-  in-flight/queued starts.
-- Clipboard subprocesses имеют byte/time bounds, generation guard и temp-file
-  cleanup.
+- DSR/CPR и DA обрабатываются Parser, а не поиском по raw PTY chunk; поэтому escape sequences могут пересекать границы чтения.
+- Поддерживаются DECOM \`?6\`, DECAWM \`?7\`, focus tracking \`?1004\`, mouse 1000/1002/1003/1006, REP, BCE и игнорируемые DCS/SOS/PM/APC strings.
+- Bracketed-paste delimiters относятся к input protocol и не переводят output Parser в отдельное paste-состояние.
+- Alternate screen отдельно сохраняет cursor и scroll region; DECSC/DECRC сохраняют rendition и charset state.
+- PTY spawn выполняется вне Emulator mutex; lifecycle generation отменяет queued и выполняющийся start.
+- Clipboard subprocess ограничен по времени и объёму; paste проверяет generation, а temp-файлы очищаются.

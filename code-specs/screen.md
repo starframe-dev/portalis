@@ -75,7 +75,8 @@ type Screen struct {
 
     scrollTop, scrollBottom int   // Границы области прокрутки (DECSTBM, 0-indexed)
     scrollback      [][]Cell   // Выведенные за пределы области строки
-    scrollbackLimit int        // Лимит размера scrollback (по умолчанию 10000)
+    scrollbackCells int        // Число ячеек в scrollback
+    scrollbackLimit int        // Лимит строк scrollback (по умолчанию 10000)
     viewOffset      int        // Смещение просмотра (сколько строк вверх от live-экрана)
 
     wrapPending bool  // true после записи в последнюю колонку; следующая буква оборачивает
@@ -101,19 +102,26 @@ type Screen struct {
 
 #### `NewScreen(rows, cols int) *Screen`
 
-Создаёт новый экран с заданными размерами. Scrollback ограничивается `defaultScrollbackLimit` (10000 строк).
+Создаёт экран с заданными размерами. Неположительные параметры нормализуются до одной ячейки. Для размеров, превышающих лимиты терминала или бюджет площади сетки, конструктор использует безопасный размер 24×80. Лимиты: 65535 строк, 65535 колонок и не более 262144 ячеек в сетке. `ResizeChecked` отклоняет недопустимый размер до аллокации и оставляет экран без изменений; совместимый `Resize` также не мутирует экран при отказе. Scrollback по умолчанию ограничен 10000 строками и всегда дополнительно ограничен 1048576 ячейками; этот cap действует и при отключении лимита строк.
 
 ```go
 s := NewScreen(24, 80)
+if err := s.ResizeChecked(40, 120); err != nil {
+    return err
+}
 ```
 
 #### `SetScrollbackLimit(limit int)`
 
 Устанавливает максимальное количество строк в scrollback буфере.
 
-- `0` или отрицательное значение — отключает лимит (не рекомендуется для долгих сессий)
-- При увеличении лимита старые строки не удаляются
-- При уменьшении лимита отбрасываются старые строки
+- `0` или отрицательное значение — отключает лимит строк; safety cap в 1048576 ячеек продолжает действовать.
+- При увеличении лимита старые строки не удаляются.
+- При уменьшении лимита отбрасываются старые строки.
+
+#### `Resize(rows, cols int)` и `ResizeChecked(rows, cols int) error`
+
+`Resize` сохраняет прежнюю совместимую сигнатуру и игнорирует недопустимый размер, оставляя экран без изменений. `ResizeChecked` возвращает ошибку при недопустимых размерах и также ничего не меняет; используйте его, если вызывающему коду нужно обработать отказ.
 
 ### Управление курсором
 
@@ -221,8 +229,9 @@ s := NewScreen(24, 80)
 
 Возвращается из альтернативного экрана:
 
-- Восстанавливает сохранённый экран
-- Восстанавливает сохранённый курсор
+- Восстанавливает сохранённый экран и курсор
+- Сохраняет main-buffer margins как full-screen при изменении высоты; custom DECSTBM margins clamp-ятся в новой геометрии
+- Parser сохраняет/восстанавливает G0/G1 charset state для `?1049`
 - Сбрасывает `wrapPending`
 
 ### Выделение текста
@@ -252,9 +261,10 @@ s := NewScreen(24, 80)
 
 Возвращает текст текущего выделения.
 
-- Каждая строка — отдельный элемент слайса
-- Trailing whitespace обрезается
-- При перетаскивании влево ячейка под мышью исключается
+- Каждая строка — отдельный элемент слайса; завершающие пробелы обрезаются.
+- При перетаскивании влево ячейка под мышью исключается.
+- Если выделение затрагивает любую половину wide cell, `SelectionText` копирует grapheme целиком один раз.
+- Сканирование ограничено 4 Mi ячейками и результат — 100 MiB; при превышении `SelectionText` возвращает `nil`.
 
 ### Рендеринг
 
@@ -264,20 +274,22 @@ s := NewScreen(24, 80)
 
 **Логика:**
 
-- Если `syncActive` → возвращает `lastRender`
+- Если `syncActive` без selection → возвращает `lastRender`
+- Если `syncActive` с selection → накладывает selection на копию последнего committed frame; не показывает uncommitted cells и не меняет `lastRender`/`renderDirty`
 - Если экран не менялся с последнего рендера (`!renderDirty`) → возвращает кэшированный `lastRender`
-- Иначе обновляет кэш, сбрасывает `renderDirty` и возвращает текущий кадр
+- Иначе обновляет кэш и возвращает текущий кадр
+- Hidden glyph под cursor/selection заменяется пробелами той же display width; cursor/selection на wide continuation покрывает glyph целиком
 - При `viewOffset > 0` строки берутся из scrollback; иначе используется live-экран
 
 #### `SetSync(active bool)`
 
-Включает/выключает синхронизированный вывод. При выходе из sync запоминает текущий кадр; при входе кэш сбрасывается только если он не был собран.
+Включает/выключает синхронизированный вывод. Вход фиксирует последний реально отрисованный кадр; выход помечает экран dirty, чтобы следующий `Render()` один раз опубликовал новое состояние.
 
 ### Утилитарные функции
 
 #### `markDirty()`
 
-Сбрасывает `renderDirty`, чтобы следующий `Render()` пересобрал кадр.
+Помечает экран изменённым; при необходимости сохраняет committed frame до следующей мутации.
 
 ## Реализация стилей
 
@@ -316,14 +328,15 @@ s := NewScreen(24, 80)
 ### Scrollback Management
 
 ```
-scrollback []Cell[Cols] — буфер выведенных строк
-scrollbackLimit int    — лимит размера (по умолчанию 10000)
+scrollback [][]Cell — выведенные строки
+scrollbackCells int — число ячеек в буфере
+scrollbackLimit int — лимит строк (по умолчанию 10000); общий cap — 1048576 ячеек
 ```
 
 При добавлении новой строки:
 
 1. Копируется содержимое верхней строки в scrollback
-2. Если `len(scrollback) > scrollbackLimit` → обрезка старых строк
+2. Удаляются старые строки при достижении лимита строк или 1048576 ячеек; объём сетки не зависит от ширины терминала
 
 ### Selection Logic
 
@@ -350,7 +363,7 @@ exclusiveStart = (startRow == endRow && startCol > endCol)
 
 ## Ограничения
 
-1. **Scrollback limit** по умолчанию 10000 строк
+1. **Scrollback** — по умолчанию не более 10000 строк и всегда не более 1048576 ячеек
 2. **Cursor** всегда в пределах `0..Rows-1` × `0..Cols-1`
 3. **Selection** работает только когда `selectionActive = true`
 4. **Synchronized output** требует явного включения через `SetSync(true)`
@@ -401,34 +414,35 @@ s.SetSync(false) // восстановление последнего кадра
 
 ## Hardening invariants
 
-- \`NewScreen\` и \`Resize\` clamp'ят размеры минимум к 1×1; публичный API не создаёт отрицательные cursor/scroll-region значения.
-- При \`?1049\` alternate screen основной buffer сохраняется отдельно; resize изменяет размеры active и saved buffer согласованно.
+- \`NewScreen\` нормализует неположительный размер до 1×1; \`ResizeChecked\` отклоняет недопустимые размеры, а совместимый \`Resize\` оставляет экран без изменений.
+- При \`?1049\` alternate screen основной buffer и terminal state сохраняются отдельно; G0/G1 charset восстанавливаются Parser.
+- Full-screen margins сохраняют полный диапазон новой высоты; custom DECSTBM margins сохраняются при grow и clamp-ятся при shrink. Сохранённый cursor также clamp-ится.
+- Resize согласованно меняет размеры active и saved buffer.
 - Прокрутка alternate screen не добавляет строки в основной scrollback.
+- При vertical shrink cursor-aware верхние строки добавляются в primary scrollback один раз, нижние строки сохраняются; активный и saved buffer вычисляют top-trim независимо.
+- Перед wrap `Put` проверяет, продолжает ли rune предыдущий grapheme; wide glyph, расширяющийся у правого края, перемещается целиком.
+- Keycap sequence с U+20E3 имеет display width 2, даже если общая Unicode width library сообщает 1.
 - Размер одного grapheme cluster ограничен \`maxGraphemeBytes\` (4096 байт), чтобы combining/ZWJ flood не создавал неограниченное потребление памяти.
-- При уменьшении scrollback limit \`viewOffset\` clamp'ится к новому размеру.
+- Scrollback ограничен 1048576 ячейками; при уменьшении line limit \`viewOffset\` clamp-ится к новому размеру.
 - Mouse state хранит DEC modes 1000/1002/1003 и SGR flag 1006; Emulator использует их для маршрутизации событий.
 
 
-## DEC state model
+## Состояния DEC
 
-- Main/alternate buffers have independent screen snapshots. \`?1049\` uses a
-  dedicated alt-screen save slot and therefore cannot overwrite the DECSC/DECRC
-  saved cursor.
-- Entering alternate screen saves main cursor, scroll region, origin mode,
-  autowrap and wrap-pending; exiting restores and clamps them to the current
-  dimensions.
-- DECSC/DECRC saves the full cursor rendition plus origin/autowrap/wrap state.
-- \`originMode\` constrains vertical cursor addressing/movement to DECSTBM.
-- \`autoWrap\` defaults to true; DECRST \`?7\` saturates writes at the right edge.
+- Основной и alternate buffers имеют независимые снимки экрана. \`?1049\` использует отдельный слот сохранения и не перезаписывает cursor из DECSC/DECRC.
+- При входе в alternate screen сохраняются main cursor, scroll region, origin mode, autowrap и wrap-pending; при выходе они восстанавливаются и clamp-ятся к актуальным размерам.
+- DECSC/DECRC сохраняет rendition cursor, а также origin/autowrap/wrap state.
+- \`originMode\` ограничивает вертикальное позиционирование и движение областью DECSTBM.
+- \`autoWrap\` по умолчанию включён; DECRST \`?7\` прекращает запись у правого края.
 
-## Background Color Erase
+## Очистка с цветом фона
 
-Erase, inserted blank cells/lines, scroll-created blank rows and whole-screen
-clear use the current cursor background color (BCE) rather than zero-value
-cells. This keeps \`TERM=xterm-256color\` colored TUI redraws visually coherent.
+Erase, вставленные пустые ячейки/строки, строки после прокрутки и очистка всего
+экрана используют текущий фон cursor (BCE), а не нулевой цвет ячейки. Это
+сохраняет корректный вид цветных TUI при \`TERM=xterm-256color\`.
 
-## Wide cells on resize
+## Wide cells при изменении размера
 
-All active, saved and scrollback rows are sanitized after resize. If a resize
-cuts between a wide base and its continuation, **both** the orphan continuation
-and the now-invalid wide base are removed.
+После resize проверяются active, saved и scrollback rows. Если граница обрезает
+wide base вместе с continuation, удаляются и осиротевшая continuation-ячейка,
+и base, который больше не образует целый glyph.

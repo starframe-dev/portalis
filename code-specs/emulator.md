@@ -47,7 +47,7 @@ func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd
 func (e *Emulator) SetScrollbackLimit(limit int)
 ```
 
-Устанавливает максимальное количество линий скролла. Значения ≤ 0 отключают лимит. Вызывать до `Start()` для вступления в силу, после `Start()` обновляет экран сразу.
+Устанавливает максимальное число строк scrollback (по умолчанию 10000). Значения ≤ 0 отключают лимит строк, но ограничение 1048576 ячеек продолжает действовать. Вызывать до `Start()` необязательно: после запуска лимит обновляет экран сразу.
 
 ```go
 func (e *Emulator) SetInitialCWD(dir string)
@@ -59,19 +59,19 @@ func (e *Emulator) SetInitialCWD(dir string)
 func (e *Emulator) SetCommandHistory(history []string)
 ```
 
-Восстанавливает ранее сохранённую историю команд.
+Восстанавливает историю команд; сохраняются не более 1000 последних записей. Входной слайс копируется.
 
 ```go
-func (e *Emulator) Close()
+func (e *Emulator) Close() error
 ```
 
-Закрывает PTY.
+Закрывает PTY, отменяет ожидающие записи и удаляет отслеживаемые clipboard temp-файлы; возвращает первую ошибку очистки.
 
 ```go
-func (e *Emulator) Stop()
+func (e *Emulator) Stop() error
 ```
 
-Завершает сессию и переключает панель на вид с ASCII-артом.
+Завершает сессию, удаляет отслеживаемые clipboard temp-файлы и переключает панель на вид с ASCII-артом; возвращает первую ошибку очистки.
 
 ```go
 func (e *Emulator) Focus()
@@ -100,16 +100,12 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd
 ### Callbacks
 
 ```go
-func (e *Emulator) OnCWDChange func(string)
+OnCWDChange             func(string)
+OnCommandHistoryChanged func([]string)
+OnError                 func(error)
 ```
 
-Вызывается при смене рабочей директории.
-
-```go
-func (e *Emulator) OnCommandHistoryChanged func([]string)
-```
-
-Вызывается при изменении истории команд.
+Поля обратных вызовов для CWD, истории и PTY/clipboard ошибок. Вызываются вне `Emulator.mu`, поэтому обработчик может повторно вызывать методы эмулятора. Срез истории передаётся как копия.
 
 ### Debug
 
@@ -117,7 +113,7 @@ func (e *Emulator) OnCommandHistoryChanged func([]string)
 func (e *Emulator) Pty() *Pty
 ```
 
-Возвращает underlying PTY для отладки.
+Возвращает внутренний PTY для отладки. Не читайте одновременно `Pty.Output` и сообщения из `Listen`; используйте только одного потребителя.
 
 ## Типы сообщений
 
@@ -155,12 +151,16 @@ type PtyReadyMsg struct {
 
 ```go
 type PtyExitMsg struct {
-    SessionID string
-    Err       error
+    SessionID     string
+    Generation    uint64
+    ProcessExited bool
+    ExitCode      int
+    Signal        os.Signal
+    Err           error
 }
 ```
 
-Подаётся, когда PTY завершил работу с ошибкой.
+Подаётся при завершении PTY, в том числе при нормальном выходе. `Err` содержит только инфраструктурную ошибку; статус процесса доступен в отдельных полях.
 
 ## Структура данных Emulator
 
@@ -180,7 +180,8 @@ type Emulator struct {
     cwd       string          // Последняя рабочая директория (OSC 7)
     commandHistory []string       // История команд (max 1000)
     initialCWD string          // Изначальная рабочая директория
-    scrollbackLimit int          // Лимит скролла
+    scrollbackLimit int          // Лимит строк scrollback
+    scrollbackCells int          // Суммарное число ячеек
     pressX, pressY int         // Позиция нажатия мыши
     dragSelecting bool          // В процессе ли drag-выбора
     mu        sync.RWMutex   // Мьютекс для синхронизации
@@ -258,7 +259,7 @@ func mouseToBytes(msg tea.MouseMsg) []byte
 
 ### Старт
 
-1. Создаётся `Screen` 24×80 (можно изменить через `SetScrollbackLimit`).
+1. Создаётся `Screen` безопасного размера 80×24; `SetScrollbackLimit` меняет только scrollback, а размер экрана задаётся сообщением ресайза.
 2. Создаётся `Parser` с callback'ом на смену рабочей директории.
 3. Запускается PTY через `spawnPty(extraEnv)`.
 4. Если ширина/высота заданы — ресайз экрана и PTY.
@@ -274,23 +275,21 @@ func mouseToBytes(msg tea.MouseMsg) []byte
 
 ### Обработка мыши
 
-- Колёсо: скроллинг вверх/вниз на 3 линии.
-- Левая кнопка:
-  - Press → запоминаем позицию.
-  - Motion > 1 клетка → начинаем drag-выбор.
-  - Release → копируем выделенный текст в буфер обмена.
-- События форвардятся в PTY только после DECSET mouse mode (`?1000`, `?1002` или `?1003`). `?1006` включает SGR encoding; без него используется X10. Shift принудительно оставляет событие локальному selection/scrollback.
+- Колесо локально прокручивает scrollback на три строки, когда child не захватил mouse mode или удерживается Shift.
+- Левая кнопка: нажатие запоминает позицию, движение начинает drag-выбор, отпускание копирует выделенный текст.
+- События передаются PTY после DECSET mouse mode (`?1000`, `?1002` или `?1003`). `?1006` включает SGR-кодирование, иначе используется X10. Shift принудительно оставляет событие локальной обработке.
 
 ### Обработка ресайза
 
-- `WindowSizeMsg` от bubbletea игнорируется — размер панели идёт через `ResizeMsg`.
-- `ResizeMsg` обновляет `width`, `height`, ресайзит экран и PTY.
-- PTY применяет каждый уникальный размер напрямую через `pty.Setsize` без потерь из-за throttle.
+- `WindowSizeMsg` содержит размер всего окна и намеренно игнорируется; host wrapper преобразует его в `ResizeMsg` с размером области эмулятора.
+- `ResizeMsg` задаёт размер контента, обновляет экран и применяет актуальный размер к PTY после attach.
+- Размеры валидируются до изменения состояния; `TIOCSWINSZ` сам посылает `SIGWINCH` foreground process group.
 
 ### Скроллинг
 
-- `scrollUp(lines)` / `scrollDown(lines)` — скролл вверх/вниз.
-- Колёсо мыши вызывает `scrollUp(3)` / `scrollDown(3)`.
+- Колесо прокручивает scrollback на три строки, если child не захватил mouse mode или удерживается Shift.
+- В режиме mouse reporting колесо передаётся дочернему процессу.
+- Scrollback ограничен 10000 строками и 1048576 ячейками.
 
 
 ## Lifecycle invariants
@@ -301,18 +300,13 @@ func mouseToBytes(msg tea.MouseMsg) []byte
 - \`PtyExitMsg\` и старые listener messages не могут завершить или модифицировать новую generation.
 
 
-## Current lifecycle and reply semantics
+## Семантика lifecycle и ответов терминала
 
-- PTY process creation runs **outside** \`Emulator.mu\`. A lifecycle token is
-  captured before spawn; \`Stop\`/\`Close\` can cancel an in-flight start.
-- \`PtyReadyMsg\`, \`PtyOutputMsg\` and \`PtyExitMsg\` carry an exact generation;
-  generation zero is not a wildcard.
-- Parser-generated DSR/DA replies are queued while parsing and written after
-  releasing \`Emulator.mu\`.
-- \`OnError func(error)\` receives PTY/clipboard message errors.
-- \`Focus()\` and \`Blur()\` return \`tea.Cmd\`; when child enabled \`?1004\`
-  they send \`CSI I\` / \`CSI O\`. \`Update\` also accepts Bubble Tea
-  \`FocusMsg\`/\`BlurMsg\`.
-- \`Close()\` and \`Stop()\` return lifecycle cleanup errors and remove tracked
-  clipboard temp files.
-- Constructor arguments, environment and restored history are defensive copies.
+- PTY создаётся вне \`Emulator.mu\`; lifecycle token фиксируется до spawn, поэтому \`Stop\`/\`Close\` могут отменить незавершённый запуск.
+- \`PtyReadyMsg\`, \`PtyOutputMsg\` и \`PtyExitMsg\` содержат точное generation; ноль не считается wildcard.
+- DSR/DA ответы накапливаются при разборе и записываются в PTY после снятия \`Emulator.mu\`.
+- \`OnError\` получает PTY/clipboard ошибки; все внешние callbacks вызываются вне mutex и могут повторно вызывать API.
+- \`Focus()\`/\`Blur()\` возвращают \`tea.Cmd\`; при включённом child режиме \`?1004\` отправляются \`CSI I\`/\`CSI O\`. \`Update\` принимает Bubble Tea \`FocusMsg\`/\`BlurMsg\`.
+- \`Close()\`/\`Stop()\` возвращают первую ошибку очистки и удаляют отслеживаемые clipboard temp-файлы.
+- Аргументы конструктора, environment и восстановленная история копируются; история хранит не более 1000 последних команд.
+- \`PtyExitMsg\` дополнительно сообщает process exit code/signal; новые поля ломают позиционные literals и требуют подходящего major semver.

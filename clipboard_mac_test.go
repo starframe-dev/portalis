@@ -3,12 +3,22 @@
 package portalis
 
 import (
+	"encoding/base64"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+const clipboardIntegrationEnv = "PORTALIS_RUN_CLIPBOARD_INTEGRATION"
+
+func requireClipboardIntegration(t *testing.T) {
+	t.Helper()
+	if os.Getenv(clipboardIntegrationEnv) != "1" {
+		t.Skipf("set %s=1 to replace the system clipboard and run this integration test", clipboardIntegrationEnv)
+	}
+}
 
 // loadImageIntoClipboard loads a PNG file into the macOS clipboard
 // using an inline Swift script. Used by the test below.
@@ -30,7 +40,7 @@ pb.clearContents()
 _ = pb.setData(data, forType: NSPasteboard.PasteboardType("public.png"))
 print("OK")
 `
-	tmp := filepath.Join(os.TempDir(), "loadclip_test.swift")
+	tmp := filepath.Join(t.TempDir(), "loadclip_test.swift")
 	if err := os.WriteFile(tmp, []byte(script), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -41,15 +51,19 @@ print("OK")
 }
 
 func TestPasteMac_Image(t *testing.T) {
+	requireClipboardIntegration(t)
 	if _, err := exec.LookPath("swift"); err != nil {
 		t.Skip("swift not available; skipping macOS image paste test")
 	}
-	png := findSamplePNG(t)
+	png := writeSamplePNG(t)
 	loadImageIntoClipboard(t, png)
 
 	text, imgPath, err := pasteMac()
 	if err != nil {
 		t.Fatalf("pasteMac: %v", err)
+	}
+	if imgPath != "" {
+		t.Cleanup(func() { _ = os.Remove(imgPath) })
 	}
 	if imgPath == "" {
 		t.Fatalf("pasteMac returned no image path; text=%q", text)
@@ -69,8 +83,11 @@ func TestPasteMac_Image(t *testing.T) {
 }
 
 func TestPasteMac_Text(t *testing.T) {
-	if err := exec.Command("bash", "-c", `echo -n "hello world" | pbcopy`).Run(); err != nil {
-		t.Skip("pbcopy not available")
+	requireClipboardIntegration(t)
+	command := exec.Command("pbcopy")
+	command.Stdin = strings.NewReader("hello world")
+	if err := command.Run(); err != nil {
+		t.Skipf("pbcopy unavailable: %v", err)
 	}
 	text, imgPath, err := pasteMac()
 	if err != nil {
@@ -84,20 +101,16 @@ func TestPasteMac_Text(t *testing.T) {
 	}
 }
 
-func findSamplePNG(t *testing.T) string {
+func writeSamplePNG(t *testing.T) string {
 	t.Helper()
-	// Look for any cached pi-clipboard PNG or fall back to a generated one.
-	for _, dir := range []string{os.TempDir()} {
-		matches, _ := filepath.Glob(filepath.Join(dir, "pi-clipboard-*.png"))
-		if len(matches) > 0 {
-			return matches[0]
-		}
+	const pixel = `iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=`
+	data, err := base64.StdEncoding.DecodeString(pixel)
+	if err != nil {
+		t.Fatalf("decode sample PNG: %v", err)
 	}
-	// Generate a minimal 1x1 PNG so the test is self-contained.
-	const px = `iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=`
-	out := filepath.Join(os.TempDir(), "test-pixel.png")
-	if err := os.WriteFile(out, []byte(px), 0o644); err != nil {
-		t.Fatal(err)
+	path := filepath.Join(t.TempDir(), "sample.png")
+	if err := os.WriteFile(path, data, 0o600); err != nil {
+		t.Fatalf("write sample PNG: %v", err)
 	}
-	return out
+	return path
 }

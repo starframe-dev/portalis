@@ -8,6 +8,12 @@ import (
 	"github.com/charmbracelet/x/ansi"
 )
 
+type legacyScreenResizer interface {
+	Resize(rows, cols int)
+}
+
+var _ legacyScreenResizer = (*Screen)(nil)
+
 func TestResizeUpPreservesContent(t *testing.T) {
 	s := NewScreen(5, 10)
 	for r := 0; r < s.Rows; r++ {
@@ -157,6 +163,136 @@ func TestSelectionExclusiveEndLeft(t *testing.T) {
 	}
 }
 
+func TestHiddenTextDoesNotLeakThroughCursorOrSelection(t *testing.T) {
+	for _, hidden := range []struct {
+		name  string
+		rune  rune
+		width int
+	}{
+		{name: "single-cell", rune: 'X', width: 1},
+		{name: "wide-cell", rune: '界', width: 2},
+	} {
+		for _, overlay := range []string{"cursor", "selection"} {
+			t.Run(hidden.name+"/"+overlay, func(t *testing.T) {
+				s := NewScreen(1, 4)
+				s.Cells[0][0] = Cell{Rune: hidden.rune, Style: StyleHidden}
+				if hidden.width == 2 {
+					s.Cells[0][1] = Cell{Continuation: true}
+				}
+				if overlay == "cursor" {
+					s.CursorVisible = true
+					s.CursorBlinkVisible = true
+					s.SetCursor(0, 0)
+				} else {
+					selectionCol := 0
+					if hidden.width == 2 {
+						selectionCol = 1
+					}
+					s.StartSelection(0, selectionCol)
+					s.ExtendSelection(0, selectionCol)
+				}
+
+				rendered := s.Render()
+				if strings.Contains(rendered, string(hidden.rune)) {
+					t.Fatalf("hidden rune leaked through %s overlay: %q", overlay, rendered)
+				}
+				if width := ansi.StringWidth(rendered); width != s.Cols {
+					t.Fatalf("render width = %d, want %d", width, s.Cols)
+				}
+			})
+		}
+	}
+}
+
+func TestWideCursorAndSelectionOverlayCoverContinuation(t *testing.T) {
+	s := NewScreen(1, 4)
+	s.Put('界')
+	s.CursorVisible = true
+	s.CursorBlinkVisible = true
+	s.SetCursor(0, 1)
+
+	cursorFrame := s.Render()
+	if !strings.Contains(cursorFrame, "\x1b[7m界") {
+		t.Fatalf("cursor on continuation did not overlay wide base: %q", cursorFrame)
+	}
+	if width := ansi.StringWidth(cursorFrame); width != s.Cols {
+		t.Fatalf("cursor frame width = %d, want %d", width, s.Cols)
+	}
+
+	s.StartSelection(0, 1)
+	s.ExtendSelection(0, 1)
+	selectionFrame := s.Render()
+	if !strings.Contains(selectionFrame, "\x1b[7m界") {
+		t.Fatalf("selection on continuation did not overlay wide base: %q", selectionFrame)
+	}
+	if width := ansi.StringWidth(selectionFrame); width != s.Cols {
+		t.Fatalf("selection frame width = %d, want %d", width, s.Cols)
+	}
+}
+
+func TestScrollbackCellBudgetKeepsNewestLinesAndViewAnchor(t *testing.T) {
+	s := NewScreen(2, 2)
+	s.SetScrollbackLimit(0)
+	for _, r := range []rune{'A', 'B'} {
+		row := []Cell{{Rune: r}, {Rune: r}}
+		s.appendScrollbackLineWithLimit(row, 4)
+	}
+	s.viewOffset = 1
+	s.appendScrollbackLineWithLimit([]Cell{{Rune: 'C'}, {Rune: 'C'}}, 4)
+
+	if len(s.scrollback) != 2 || s.scrollbackCells != 4 {
+		t.Fatalf("scrollback size = %d rows / %d cells, want 2 / 4", len(s.scrollback), s.scrollbackCells)
+	}
+	if got := s.contentRowCells(-s.viewOffset)[0].Rune; got != 'B' {
+		t.Fatalf("anchored scrollback row = %q, want B", got)
+	}
+	if got := s.scrollback[len(s.scrollback)-1][0].Rune; got != 'C' {
+		t.Fatalf("newest scrollback row = %q, want C", got)
+	}
+}
+
+func TestSelectionTextEnforcesByteAndCellBudgets(t *testing.T) {
+	s := NewScreen(1, 8)
+	for _, r := range "ABCDEFGH" {
+		s.Put(r)
+	}
+	s.StartSelection(0, 0)
+	s.ExtendSelection(0, 7)
+
+	if _, err := s.selectionTextWithLimit(7, 100); err == nil {
+		t.Fatal("selection exceeding byte budget was accepted")
+	}
+	if _, err := s.selectionTextWithLimit(100, 7); err == nil {
+		t.Fatal("selection exceeding visited-cell budget was accepted")
+	}
+	if got := s.SelectionText(); len(got) != 1 || got[0] != "ABCDEFGH" {
+		t.Fatalf("selection within default budgets = %q", got)
+	}
+}
+
+func TestSelectionTextIncludesWideGlyphWhenContinuationIsSelected(t *testing.T) {
+	for _, test := range []struct {
+		name           string
+		anchor, cursor int
+	}{
+		{name: "continuation-only", anchor: 2, cursor: 2},
+		{name: "leftward-excludes-base-but-includes-continuation", anchor: 2, cursor: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewScreen(1, 5)
+			s.Put('A')
+			s.Put('界')
+			s.Put('B')
+			s.StartSelection(0, test.anchor)
+			s.ExtendSelection(0, test.cursor)
+			text := s.SelectionText()
+			if len(text) != 1 || text[0] != "界" {
+				t.Fatalf("selection text = %q, want the complete wide glyph", text)
+			}
+		})
+	}
+}
+
 func TestSelectionInclusiveEndRight(t *testing.T) {
 	s := NewScreen(1, 10)
 	for c := 0; c < s.Cols; c++ {
@@ -171,17 +307,25 @@ func TestSelectionInclusiveEndRight(t *testing.T) {
 	}
 }
 
-func TestResizeUpResetsScrollRegion(t *testing.T) {
+func TestResizePreservesAndClampsCustomScrollRegion(t *testing.T) {
 	s := NewScreen(5, 10)
 	s.SetScrollRegion(2, 4)
 	if s.scrollTop != 1 || s.scrollBottom != 3 {
 		t.Fatalf("unexpected initial scroll region: %d-%d", s.scrollTop, s.scrollBottom)
 	}
 
-	s.Resize(10, 10)
+	if err := s.ResizeChecked(10, 10); err != nil {
+		t.Fatal(err)
+	}
+	if s.scrollTop != 1 || s.scrollBottom != 3 {
+		t.Fatalf("grown custom scroll region = %d-%d, want 1-3", s.scrollTop, s.scrollBottom)
+	}
 
-	if s.scrollTop != 0 || s.scrollBottom != 9 {
-		t.Errorf("scroll region not reset after resize: %d-%d", s.scrollTop, s.scrollBottom)
+	if err := s.ResizeChecked(3, 10); err != nil {
+		t.Fatal(err)
+	}
+	if s.scrollTop != 1 || s.scrollBottom != 2 {
+		t.Fatalf("shrunk custom scroll region = %d-%d, want 1-2", s.scrollTop, s.scrollBottom)
 	}
 }
 
@@ -189,6 +333,107 @@ func TestResizeUpResetsScrollRegion(t *testing.T) {
 // the previous width are truncated to the new column count instead of keeping
 // their original width (which would visually clip the right side after the
 // terminal is narrowed).
+func TestResizeShrinkMovesUpperRowsToScrollbackExactlyOnce(t *testing.T) {
+	s := NewScreen(8, 4)
+	s.scrollback = [][]Cell{cellsFromText("P", s.Cols), cellsFromText("Q", s.Cols)}
+	s.viewOffset = 1
+	for row := range s.Cells {
+		s.Cells[row] = cellsFromText(string(rune('A'+row)), s.Cols)
+	}
+	s.SetScrollRegion(3, 7)
+	s.SetCursor(5, 0)
+
+	if err := s.ResizeChecked(5, 4); err != nil {
+		t.Fatal(err)
+	}
+	if got := []rune{
+		s.Cells[0][0].Rune,
+		s.Cells[1][0].Rune,
+		s.Cells[2][0].Rune,
+		s.Cells[3][0].Rune,
+		s.Cells[4][0].Rune,
+	}; string(got) != "DEFGH" {
+		t.Fatalf("surviving lower rows = %q, want DEFGH", string(got))
+	}
+	if got := []rune{
+		s.scrollback[0][0].Rune,
+		s.scrollback[1][0].Rune,
+		s.scrollback[2][0].Rune,
+		s.scrollback[3][0].Rune,
+		s.scrollback[4][0].Rune,
+	}; string(got) != "PQABC" {
+		t.Fatalf("scrollback order = %q, want PQABC", string(got))
+	}
+	if row, col := s.CursorPos(); row != 2 || col != 0 {
+		t.Fatalf("cursor after shrink = (%d,%d), want (2,0)", row, col)
+	}
+	if s.scrollTop != 0 || s.scrollBottom != 3 {
+		t.Fatalf("custom margins after top trim = %d..%d, want 0..3", s.scrollTop, s.scrollBottom)
+	}
+	if s.viewOffset != 4 {
+		t.Fatalf("scrollback view offset = %d, want 4 to keep its anchor", s.viewOffset)
+	}
+	if err := s.ResizeChecked(5, 4); err != nil {
+		t.Fatal(err)
+	}
+	if len(s.scrollback) != 5 {
+		t.Fatalf("same-size resize duplicated truncated rows: scrollback has %d lines", len(s.scrollback))
+	}
+	if err := s.ResizeChecked(4, 4); err != nil {
+		t.Fatal(err)
+	}
+	if got := []rune{
+		s.scrollback[0][0].Rune,
+		s.scrollback[1][0].Rune,
+		s.scrollback[2][0].Rune,
+		s.scrollback[3][0].Rune,
+		s.scrollback[4][0].Rune,
+		s.scrollback[5][0].Rune,
+	}; string(got) != "PQABCD" {
+		t.Fatalf("successive shrink scrollback = %q, want PQABCD", string(got))
+	}
+	if got := []rune{
+		s.Cells[0][0].Rune,
+		s.Cells[1][0].Rune,
+		s.Cells[2][0].Rune,
+		s.Cells[3][0].Rune,
+	}; string(got) != "EFGH" {
+		t.Fatalf("surviving rows after second shrink = %q, want EFGH", string(got))
+	}
+}
+
+func TestAltResizeMovesPrimaryUpperRowsToScrollback(t *testing.T) {
+	s := NewScreen(6, 4)
+	for row := range s.Cells {
+		s.Cells[row] = cellsFromText(string(rune('A'+row)), s.Cols)
+	}
+	s.SetScrollRegion(2, 5)
+	s.SetCursor(4, 0)
+	s.EnterAltScreen()
+
+	if err := s.ResizeChecked(4, 4); err != nil {
+		t.Fatal(err)
+	}
+	s.ExitAltScreen()
+	if got := []rune{
+		s.Cells[0][0].Rune,
+		s.Cells[1][0].Rune,
+		s.Cells[2][0].Rune,
+		s.Cells[3][0].Rune,
+	}; string(got) != "CDEF" {
+		t.Fatalf("restored lower primary rows = %q, want CDEF", string(got))
+	}
+	if got := []rune{s.scrollback[0][0].Rune, s.scrollback[1][0].Rune}; string(got) != "AB" {
+		t.Fatalf("primary scrollback after alt resize = %q, want AB", string(got))
+	}
+	if s.scrollTop != 0 || s.scrollBottom != 2 {
+		t.Fatalf("restored custom margins = %d..%d, want 0..2", s.scrollTop, s.scrollBottom)
+	}
+	if row, _ := s.CursorPos(); row != 2 {
+		t.Fatalf("restored primary cursor row = %d, want 2", row)
+	}
+}
+
 func TestResizeShrinkTruncatesScrollback(t *testing.T) {
 	s := NewScreen(3, 20)
 	// Fill the first line so that the next Newline scrolls it into scrollback.
@@ -492,6 +737,62 @@ func TestEmojiClustersStayInOneWideCell(t *testing.T) {
 	}
 }
 
+func TestGraphemeClustersAtRightEdgeStayTogether(t *testing.T) {
+	for _, test := range []struct {
+		name    string
+		cluster string
+		width   int
+	}{
+		{name: "zwj", cluster: "👩‍💻", width: 2},
+		{name: "regional-indicator", cluster: "🇺🇸", width: 2},
+		{name: "modifier", cluster: "👍🏽", width: 2},
+		{name: "keycap", cluster: "1️⃣", width: 2},
+		{name: "variation-selector", cluster: "❤️", width: 2},
+		{name: "combining", cluster: "é", width: 1},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			s := NewScreen(2, 4)
+			startCol := 4 - test.width
+			for range startCol {
+				s.Put('x')
+			}
+			for _, r := range test.cluster {
+				s.Put(r)
+			}
+			if got := cellText(s.Cells[0][startCol]); got != test.cluster {
+				t.Fatalf("right-edge grapheme = %q, want %q", got, test.cluster)
+			}
+			if !s.wrapPending {
+				t.Fatal("cluster ending at right edge did not retain pending wrap")
+			}
+			s.Put('Z')
+			if got := s.Cells[1][0].Rune; got != 'Z' {
+				t.Fatalf("next rune = %q, want wrapped Z", got)
+			}
+			if got := cellText(s.Cells[0][startCol]); got != test.cluster {
+				t.Fatalf("right-edge grapheme split after wrap: %q", got)
+			}
+		})
+	}
+}
+
+func TestVariationSelectorWidensPendingRightEdgeGrapheme(t *testing.T) {
+	s := NewScreen(2, 4)
+	s.PutBytes([]byte("xxx"))
+	s.Put('❤')
+	s.Put('\ufe0f')
+
+	if got := s.RenderLine(0); got != "xxx " {
+		t.Fatalf("first line = %q, want base moved as a whole", got)
+	}
+	if got := cellText(s.Cells[1][0]); got != "❤️" || !s.Cells[1][1].Continuation {
+		t.Fatalf("widened grapheme on next row = %+v, want complete wide heart", s.Cells[1][:2])
+	}
+	if s.Cursor.Row != 1 || s.Cursor.Col != 2 {
+		t.Fatalf("cursor after grapheme reflow = (%d,%d), want (1,2)", s.Cursor.Row, s.Cursor.Col)
+	}
+}
+
 func TestOverwriteWideContinuationClearsWholeGlyph(t *testing.T) {
 	s := NewScreen(1, 4)
 	s.Put('✅')
@@ -608,6 +909,54 @@ func TestPutBytesCapsAtRowBoundary(t *testing.T) {
 	}
 	if !s.wrapPending {
 		t.Errorf("expected wrapPending at row end")
+	}
+}
+
+func TestSyncSelectionOverlaysCommittedFrameWithoutCommitting(t *testing.T) {
+	s := NewScreen(1, 5)
+	for _, r := range "old" {
+		s.Put(r)
+	}
+	frozen := s.Render()
+	s.SetSync(true)
+
+	s.SetCursor(0, 0)
+	for _, r := range "new" {
+		s.Put(r)
+	}
+	s.StartSelection(0, 0)
+	s.ExtendSelection(0, 1)
+
+	selected := s.Render()
+	if got := ansi.Strip(selected); got != "old  " {
+		t.Fatalf("selection overlay rendered uncommitted screen %q, want committed frame", got)
+	}
+	if s.lastRender != frozen || !s.renderDirty {
+		t.Fatal("selection overlay committed the synchronized frame")
+	}
+
+	s.ClearSelection()
+	if got := s.Render(); got != frozen {
+		t.Fatalf("frame without selection = %q, want frozen %q", got, frozen)
+	}
+}
+
+func TestSyncSelectionKeepsCommittedCursorAcrossParserMutation(t *testing.T) {
+	s := NewScreen(1, 4)
+	s.CursorBlinkVisible = true
+	p := NewParser(s)
+	p.Feed([]byte("AB"))
+	s.Render()
+	p.Feed([]byte("\r\x1b[?2026h"))
+	s.StartSelection(0, 3)
+	s.ExtendSelection(0, 3)
+
+	frame := s.Render()
+	if !strings.Contains(frame, "AB\x1b[7m ") {
+		t.Fatalf("selection overlay did not use committed cursor position: %q", frame)
+	}
+	if strings.HasPrefix(frame, "\x1b[7mA") {
+		t.Fatalf("selection overlay exposed uncommitted cursor position: %q", frame)
 	}
 }
 
@@ -1105,6 +1454,54 @@ func TestAltScreenResizePreservesPrimaryDimensions(t *testing.T) {
 	}
 }
 
+func TestAltScreenResizeRestoresFullScreenMainMargins(t *testing.T) {
+	for _, size := range []struct {
+		name string
+		rows int
+	}{
+		{name: "grow", rows: 40},
+		{name: "shrink", rows: 12},
+	} {
+		t.Run(size.name, func(t *testing.T) {
+			s := NewScreen(24, 80)
+			s.EnterAltScreen()
+			if err := s.ResizeChecked(size.rows, 80); err != nil {
+				t.Fatal(err)
+			}
+			s.ExitAltScreen()
+			if s.scrollTop != 0 || s.scrollBottom != size.rows-1 {
+				t.Fatalf("restored full-screen margins = %d..%d, want 0..%d", s.scrollTop, s.scrollBottom, size.rows-1)
+			}
+		})
+	}
+}
+
+func TestAltScreenResizeClampsCustomMainMarginsAndCursor(t *testing.T) {
+	s := NewScreen(8, 10)
+	s.SetScrollRegion(2, 6)
+	s.SetOriginMode(true)
+	s.SetCursor(7, 9)
+	s.EnterAltScreen()
+	s.SetScrollRegion(3, 6)
+
+	if err := s.ResizeChecked(4, 6); err != nil {
+		t.Fatal(err)
+	}
+	if s.scrollTop != 2 || s.scrollBottom != 3 {
+		t.Fatalf("alternate margins after shrink = %d..%d, want 2..3", s.scrollTop, s.scrollBottom)
+	}
+	s.ExitAltScreen()
+	if s.scrollTop != 0 || s.scrollBottom != 1 {
+		t.Fatalf("restored custom main margins = %d..%d, want 0..1 after top trim", s.scrollTop, s.scrollBottom)
+	}
+	if !s.originMode {
+		t.Fatal("main origin mode was not restored")
+	}
+	if row, col := s.CursorPos(); row != 3 || col != 5 {
+		t.Fatalf("restored/clamped cursor = %d,%d, want 3,5", row, col)
+	}
+}
+
 func TestAltScreenDoesNotPolluteScrollback(t *testing.T) {
 	s := NewScreen(2, 4)
 	s.EnterAltScreen()
@@ -1134,17 +1531,60 @@ func TestGraphemeCombiningDataIsBounded(t *testing.T) {
 	}
 }
 
-func TestScreenDimensionsAreClamped(t *testing.T) {
+func TestScreenDimensionsNormalizeConstructionAndRejectInvalidResize(t *testing.T) {
 	s := NewScreen(0, -5)
 	if s.Rows != 1 || s.Cols != 1 {
-		t.Fatalf("NewScreen clamped to %dx%d, want 1x1", s.Rows, s.Cols)
+		t.Fatalf("NewScreen normalized to %dx%d, want 1x1", s.Rows, s.Cols)
 	}
-	s.Resize(0, 0)
+	if err := s.ResizeChecked(0, 0); err == nil {
+		t.Fatal("Resize(0, 0) unexpectedly succeeded")
+	}
 	if s.Rows != 1 || s.Cols != 1 {
-		t.Fatalf("Resize clamped to %dx%d, want 1x1", s.Rows, s.Cols)
+		t.Fatalf("invalid resize changed dimensions to %dx%d", s.Rows, s.Cols)
 	}
 	if s.Cursor.Row < 0 || s.Cursor.Col < 0 {
 		t.Fatalf("cursor became negative: %+v", s.Cursor)
+	}
+}
+
+func TestResizeRejectsHugeDimensions(t *testing.T) {
+	s := NewScreen(2, 3)
+	invalid := [][2]int{
+		{65536, 1},
+		{1, 65536},
+		{1000000, 1000000},
+		{0, 1},
+		{1, 0},
+		{-1, 3},
+		{2, -1},
+		{513, 512},
+	}
+	for _, size := range invalid {
+		if err := s.ResizeChecked(size[0], size[1]); err == nil {
+			t.Errorf("Resize(%d, %d) unexpectedly succeeded", size[0], size[1])
+		}
+		if s.Rows != 2 || s.Cols != 3 {
+			t.Fatalf("invalid Resize(%d, %d) changed dimensions to %dx%d", size[0], size[1], s.Rows, s.Cols)
+		}
+	}
+}
+
+func TestResizeAcceptsMaximumSingleDimension(t *testing.T) {
+	for _, size := range [][2]int{{65535, 1}, {1, 65535}} {
+		s := NewScreen(1, 1)
+		if err := s.ResizeChecked(size[0], size[1]); err != nil {
+			t.Fatalf("Resize(%d, %d): %v", size[0], size[1], err)
+		}
+		if s.Rows != size[0] || s.Cols != size[1] {
+			t.Fatalf("screen dimensions = %dx%d, want %dx%d", s.Rows, s.Cols, size[0], size[1])
+		}
+	}
+}
+
+func TestNewScreenFallsBackForOversizedArea(t *testing.T) {
+	s := NewScreen(1000000, 1000000)
+	if s.Rows != defaultTerminalRows || s.Cols != defaultTerminalCols {
+		t.Fatalf("oversized constructor dimensions = %dx%d, want %dx%d", s.Rows, s.Cols, defaultTerminalRows, defaultTerminalCols)
 	}
 }
 

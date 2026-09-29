@@ -12,7 +12,7 @@
 func NewParser(screen *Screen) *Parser
 ```
 
-Создаёт новый парсер для заданного экрана.
+Создаёт новый парсер для заданного ненулевого `Screen`. `Parser` не потокобезопасен; не вызывайте его методы параллельно.
 
 **Параметры:**
 - `screen` — указатель на объект `Screen`, к которому применяется парсинг
@@ -30,7 +30,7 @@ func NewParser(screen *Screen) *Parser
 func (p *Parser) SetCWDCallback(fn func(string))
 ```
 
-Устанавливает обратный вызов, который срабатывает при изменении рабочей директории.
+Устанавливает callback, который `Feed` вызывает синхронно при изменении рабочей директории. Он должен быстро завершиться и не вызывать повторно `Feed`.
 
 **Параметры:**
 - `fn` — функция, принимающая путь к рабочей директории
@@ -184,6 +184,8 @@ func (p *Parser) handleSGR(params []int)
 - `30-37` — стандартные цвета текста
 - `38;5;N` — 256-цвет (5)
 - `38;2;R;G;B` — RGB (2)
+- `38:5:N`, `38:2:R:G:B`, `38:2::R:G:B` — colon forms для 256-color/RGB; аналогично `48` для фона
+- Нестандартные colon underline submodes (например, `4:2`) не реализованы
 - `39` — сброс цвета текста
 - `40-47` — стандартные цвета фона
 - `48;5;N` — 256-цвет (5)
@@ -474,34 +476,34 @@ CSI-последовательности и продолжает обычный 
 - CSI buffer ограничен 4096 байт; malformed/unterminated CSI не может расти бесконечно.
 - OSC buffer ограничен 64 KiB.
 - Invalid UTF-8 восстанавливается через replacement rune без накопления неограниченного \`utf8Buf\`.
-- OSC 7 path percent-decode'ится как URL path и отклоняется при NUL, BEL, ESC, CR или LF.
+- OSC 7 path percent-decode'ится как URL path; принимаются hostless, loopback, `localhost` и hostname текущего компьютера. Remote host, userinfo, port, query/fragment и NUL/BEL/ESC/CR/LF отклоняются.
 - 256-color cube соответствует xterm, а RGB компоненты clamp'ятся к 0…255.
 
 
-## Terminal replies
+## Ответы терминала
 
-Parser может получать неблокирующий response callback через \`SetResponseCallback\`.
-Это позволяет корректно отвечать независимо от PTY read boundaries:
+Parser принимает callback ответов через \`SetResponseCallback\`. Callback вызывается
+синхронно внутри \`Parser.Feed\`, поэтому он не должен блокировать или повторно
+входить в Parser. Emulator накапливает ответы и записывает их в PTY после снятия mutex.
+Ответы не зависят от границ PTY reads:
 
 - \`CSI 5 n\` → \`CSI 0 n\`;
 - \`CSI 6 n\` → фактический \`CSI row;col R\`;
 - \`CSI c\` → primary device attributes;
 - \`CSI > c\` → secondary device attributes.
 
-Ответы queue'ятся Emulator'ом во время \`Parser.Feed\` и записываются в PTY после
-снятия mutex.
+## Строковые управляющие последовательности
 
-## String controls
+7-bit \`DCS (ESC P)\`, \`SOS (ESC X)\`, \`PM (ESC ^)\`, \`APC (ESC _)\` и
+соответствующие C1 формы игнорируются до ST; их содержимое никогда не выводится
+на экран. OSC завершается BEL, \`ESC \\\` или C1 ST.
 
-7-bit \`DCS (ESC P)\`, \`SOS (ESC X)\`, \`PM (ESC ^)\`, \`APC (ESC _)\`, а
-также соответствующие C1 формы, игнорируются до ST. Payload никогда не попадает
-на экран. OSC поддерживает BEL, \`ESC \\\` и C1 ST как terminator.
-
-## Additional xterm/VT semantics
+## Дополнительная VT/xterm-семантика
 
 - \`CSI Ps b\` (REP) повторяет предыдущий grapheme cluster.
-- ED2 очищает display без перемещения cursor.
+- ED2 очищает экран без перемещения курсора.
 - ED1 и ED3 поддерживаются; ED3 очищает scrollback.
-- DECSC/DECRC сохраняют position, SGR, origin/autowrap state и активные G0/G1 charsets.
+- DECSC/DECRC сохраняют позицию, SGR, origin/autowrap modes и активные G0/G1 charsets.
+- `?1049` сохраняет и восстанавливает G0/G1 charset вместе с alternate screen.
 - CUP/HVP/VPA учитывают DECOM и активный scroll region.
-- BCE применяется к erase/insert/delete/scroll-created blank cells.
+- BCE применяется к ячейкам, создаваемым erase/insert/delete/scroll.

@@ -3,12 +3,138 @@ package portalis
 import (
 	"errors"
 	"os"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	creackpty "github.com/creack/pty"
 )
+
+func TestStartResizeUsesLatestDimensions(t *testing.T) {
+	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
+	emulator.screen = NewScreen(defaultTerminalRows, defaultTerminalCols)
+	emulator.listenerGeneration = 1
+	pty := &Pty{ptmx: &os.File{}}
+	firstResizeStarted := make(chan struct{})
+	releaseFirstResize := make(chan struct{})
+	var applied []creackpty.Winsize
+	pty.setSize = func(_ *os.File, size *creackpty.Winsize) error {
+		applied = append(applied, *size)
+		if len(applied) == 1 {
+			close(firstResizeStarted)
+			<-releaseFirstResize
+		}
+		return nil
+	}
+	emulator.pty = pty
+	generation := emulator.listenerGeneration
+
+	startResize := make(chan error, 1)
+	go func() {
+		_, err := emulator.resizeAttachedPTY(pty, generation)
+		startResize <- err
+	}()
+	<-firstResizeStarted
+
+	// This is the locked state update used by ResizeMsg. Keep the first PTY
+	// ioctl blocked so Start must detect the newer generation before returning.
+	emulator.mu.Lock()
+	if err := emulator.updateTerminalSizeLocked(40, 120); err != nil {
+		emulator.mu.Unlock()
+		close(releaseFirstResize)
+		t.Fatal(err)
+	}
+	emulator.mu.Unlock()
+	close(releaseFirstResize)
+
+	if err := <-startResize; err != nil {
+		t.Fatalf("start resize: %v", err)
+	}
+	if pty.lastRows != 40 || pty.lastCols != 120 {
+		t.Fatalf("PTY size = %dx%d, want latest 40x120", pty.lastRows, pty.lastCols)
+	}
+	if emulator.screen.Rows != 40 || emulator.screen.Cols != 120 {
+		t.Fatalf("Screen size = %dx%d, want 40x120", emulator.screen.Rows, emulator.screen.Cols)
+	}
+	if len(applied) != 2 || applied[0].Rows != 24 || applied[0].Cols != 80 || applied[1].Rows != 40 || applied[1].Cols != 120 {
+		t.Fatalf("applied PTY sizes = %#v, want [24x80 40x120]", applied)
+	}
+}
+
+func TestInitialPTYHasSaneWinsize(t *testing.T) {
+	pty, err := Spawn("/bin/sh", []string{"-c", "stty size"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pty.Close()
+
+	var output strings.Builder
+	for {
+		msg := pty.Listen("session")()
+		switch msg := msg.(type) {
+		case PtyOutputMsg:
+			output.Write(msg.Data)
+		case PtyExitMsg:
+			if !strings.Contains(output.String(), "24 80") {
+				t.Fatalf("child observed initial PTY size %q, want 24 80", output.String())
+			}
+			return
+		default:
+			t.Fatalf("unexpected PTY message %T", msg)
+		}
+	}
+}
+
+func TestScrollbackZeroBeforeStartDisablesLimit(t *testing.T) {
+	emulator := NewEmulator("session", "Session", "/bin/sh", []string{"-c", "sleep 5"})
+	emulator.SetScrollbackLimit(0)
+	if err := emulator.StartSync(nil); err != nil {
+		t.Fatal(err)
+	}
+	defer emulator.Close()
+
+	emulator.mu.RLock()
+	limit := emulator.screen.scrollbackLimit
+	emulator.mu.RUnlock()
+	if limit != 0 {
+		t.Fatalf("pre-start scrollback limit = %d, want 0 (unlimited)", limit)
+	}
+}
+
+func TestPanelResizeRejectsInvalidDimensionsBeforeMutation(t *testing.T) {
+	screen := NewScreen(2, 3)
+	resizeCalls := 0
+	pty := &Pty{
+		ptmx: &os.File{},
+		setSize: func(_ *os.File, _ *creackpty.Winsize) error {
+			resizeCalls++
+			return nil
+		},
+	}
+	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
+	emulator.screen = screen
+	emulator.pty = pty
+
+	for _, size := range []ResizeMsg{
+		{Width: 65536, Height: 1},
+		{Width: 1000000, Height: 1000000},
+	} {
+		if cmd := emulator.Update(size); cmd != nil {
+			t.Fatalf("invalid resize returned command %T", cmd)
+		}
+		if screen.Rows != 2 || screen.Cols != 3 {
+			t.Fatalf("invalid resize changed screen to %dx%d", screen.Rows, screen.Cols)
+		}
+	}
+	if resizeCalls != 0 {
+		t.Fatalf("invalid resize reached PTY %d times, want 0", resizeCalls)
+	}
+	if emulator.width != defaultTerminalCols || emulator.height != defaultTerminalRows {
+		t.Fatalf("invalid resize changed requested size to %dx%d", emulator.height, emulator.width)
+	}
+}
 
 func TestPtyOutputFeedsParserImmediatelyAndContinuesListener(t *testing.T) {
 	screen := NewScreen(2, 20)
@@ -176,6 +302,24 @@ func TestSetCommandHistoryUsesDefensiveCopy(t *testing.T) {
 	}
 }
 
+func TestSetCommandHistoryKeepsNewestLimit(t *testing.T) {
+	history := make([]string, maxCommandHistory+1)
+	history[0] = "oldest"
+	history[1] = "first retained"
+	history[len(history)-1] = "newest"
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.SetCommandHistory(history)
+
+	em.mu.RLock()
+	defer em.mu.RUnlock()
+	if len(em.commandHistory) != maxCommandHistory {
+		t.Fatalf("history size = %d, want %d", len(em.commandHistory), maxCommandHistory)
+	}
+	if em.commandHistory[0] != "first retained" || em.commandHistory[len(em.commandHistory)-1] != "newest" {
+		t.Fatalf("restored history did not retain newest entries: first=%q last=%q", em.commandHistory[0], em.commandHistory[len(em.commandHistory)-1])
+	}
+}
+
 func TestStalePtyOutputGenerationIsIgnored(t *testing.T) {
 	em := NewEmulator("session", "Session", "/bin/sh", nil)
 	em.mu.Lock()
@@ -252,7 +396,7 @@ func TestResetTerminalClearsStaleCWD(t *testing.T) {
 
 func TestMouseEncodingUsesCorrectXtermCodes(t *testing.T) {
 	wheel := tea.MouseMsg{X: 1, Y: 2, Action: tea.MouseActionPress, Button: tea.MouseButtonWheelUp}
-	if got, want := string(mouseToBytes(wheel, true)), "[<64;2;3M"; got != want {
+	if got, want := string(mouseToBytes(wheel, true)), "\x1b[<64;2;3M"; got != want {
 		t.Fatalf("SGR wheel = %q, want %q", got, want)
 	}
 
@@ -338,7 +482,7 @@ func TestFocusReportingWritesDECSequence(t *testing.T) {
 	if _, err := r.Read(buf); err != nil {
 		t.Fatal(err)
 	}
-	if got := string(buf); got != "[I" {
+	if got := string(buf); got != "\x1b[I" {
 		t.Fatalf("focus report = %q, want ESC[I", got)
 	}
 }

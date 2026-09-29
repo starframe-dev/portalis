@@ -41,6 +41,9 @@ func (m *readmeHost) View() string {
 var _ tea.Model = (*readmeHost)(nil)
 
 func TestReadmeHostIntegrationCompiles(t *testing.T) {
+	_ = tea.WithAltScreen()
+	_ = tea.WithMouseCellMotion()
+	_ = tea.WithReportFocus()
 	host := newReadmeHost()
 	if host.term == nil {
 		t.Fatal("README host created nil emulator")

@@ -2,7 +2,9 @@ package portalis
 
 import (
 	"fmt"
+	"net"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -11,22 +13,28 @@ import (
 	"github.com/charmbracelet/lipgloss"
 )
 
-// Parser parses ANSI escape sequences and updates a Screen.
+// Parser parses ANSI escape sequences and updates a Screen. It is not safe for
+// concurrent use; callbacks run synchronously during Feed and must not re-enter
+// the parser.
 type Parser struct {
-	screen             *Screen
-	state              ansiState
-	buf                strings.Builder
-	utf8Buf            []byte
-	onCWD              func(string)
-	onResponse         func([]byte)
-	lastCWD            string
-	escapeIntermediate byte
-	g0LineDrawing      bool
-	g1LineDrawing      bool
-	useG1              bool
-	savedG0LineDrawing bool
-	savedG1LineDrawing bool
-	savedUseG1         bool
+	screen                *Screen
+	state                 ansiState
+	buf                   strings.Builder
+	utf8Buf               []byte
+	onCWD                 func(string)
+	onResponse            func([]byte)
+	lastCWD               string
+	escapeIntermediate    byte
+	g0LineDrawing         bool
+	g1LineDrawing         bool
+	useG1                 bool
+	savedG0LineDrawing    bool
+	savedG1LineDrawing    bool
+	savedUseG1            bool
+	altSavedG0LineDrawing bool
+	altSavedG1LineDrawing bool
+	altSavedUseG1         bool
+	altCharsetSaved       bool
 }
 
 type ansiState int
@@ -51,14 +59,15 @@ func NewParser(screen *Screen) *Parser {
 	return &Parser{screen: screen}
 }
 
-// SetCWDCallback sets the callback invoked when the working directory changes.
+// SetCWDCallback sets a callback invoked synchronously by Feed for OSC 7 changes.
+// The callback must return promptly and must not re-enter the parser.
 func (p *Parser) SetCWDCallback(fn func(string)) {
 	p.onCWD = fn
 }
 
-// SetResponseCallback receives terminal-generated replies such as DSR/DA.
-// The callback must not block; Emulator queues replies and writes them after
-// releasing its state mutex.
+// SetResponseCallback receives terminal-generated replies synchronously during
+// Feed, such as DSR/DA. The callback must not block or re-enter the parser;
+// Emulator queues replies and writes them after releasing its state mutex.
 func (p *Parser) SetResponseCallback(fn func([]byte)) {
 	p.onResponse = fn
 }
@@ -92,11 +101,6 @@ func (p *Parser) flushUtf8() {
 	// Incomplete sequence — emit one replacement rune for the invalid scalar.
 	p.screen.Put('\ufffd')
 	p.utf8Buf = p.utf8Buf[:0]
-}
-
-// utf8Valid returns true if the byte slice is a complete, valid UTF-8 sequence.
-func utf8Valid(buf []byte) bool {
-	return utf8.FullRune(buf) && utf8.Valid(buf)
 }
 
 // Feed feeds data into the parser.
@@ -155,12 +159,14 @@ func (p *Parser) feedByte(b byte) {
 		}
 		if b == '\r' {
 			p.flushUtf8()
+			p.screen.markDirty()
 			p.screen.Cursor.Col = 0
 			p.screen.wrapPending = false
 			return
 		}
 		if b == '\n' {
 			p.flushUtf8()
+			p.screen.markDirty()
 			// If a wrap is pending, LF behaves like CR+LF.
 			if p.screen.wrapPending {
 				p.screen.wrapPending = false
@@ -171,6 +177,7 @@ func (p *Parser) feedByte(b byte) {
 		}
 		if b == '\t' {
 			p.flushUtf8()
+			p.screen.markDirty()
 			p.screen.wrapPending = false
 			next := (p.screen.Cursor.Col/8 + 1) * 8
 			if next >= p.screen.Cols {
@@ -181,6 +188,7 @@ func (p *Parser) feedByte(b byte) {
 		}
 		if b == '\b' {
 			p.flushUtf8()
+			p.screen.markDirty()
 			p.screen.wrapPending = false
 			if p.screen.Cursor.Col > 0 {
 				p.screen.Cursor.Col--
@@ -368,20 +376,21 @@ func (p *Parser) handleOSC(payload string) {
 	}
 }
 
-// extractOSC7Path extracts an absolute filesystem path from an OSC 7 payload.
-// Supported forms:
-//
-//	file://hostname/path  → /path
-//	/absolute/path        → /absolute/path
+// extractOSC7Path extracts an absolute local filesystem path from an OSC 7 payload.
+// file URLs are accepted only for an empty, loopback, or current-host authority.
 func extractOSC7Path(s string) string {
 	s = strings.TrimSpace(s)
 	var path string
 	if strings.HasPrefix(s, "file://") {
 		u, err := url.Parse(s)
-		if err != nil || u.Scheme != "file" {
+		if err != nil || u.Scheme != "file" || u.User != nil || u.Port() != "" ||
+			u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || !isLocalOSC7Host(u.Hostname()) {
 			return ""
 		}
 		path = u.Path
+		if !filepath.IsAbs(path) {
+			return ""
+		}
 	} else if filepath.IsAbs(s) {
 		path = s
 	} else {
@@ -393,6 +402,17 @@ func extractOSC7Path(s string) string {
 		}
 	}
 	return path
+}
+
+func isLocalOSC7Host(host string) bool {
+	if host == "" || strings.EqualFold(host, "localhost") || strings.EqualFold(host, "localhost.localdomain") {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil && ip.IsLoopback() {
+		return true
+	}
+	localHost, err := os.Hostname()
+	return err == nil && strings.EqualFold(host, localHost)
 }
 
 func (p *Parser) handleCSI(seq string) {
@@ -420,7 +440,7 @@ func (p *Parser) handleCSI(seq string) {
 		if isPrivate {
 			break // ignore private SGR
 		}
-		p.handleSGR(params)
+		p.handleSGRSequence(rawParams)
 	case 'H', 'f':
 		row := 1
 		col := 1
@@ -605,12 +625,27 @@ func (p *Parser) setPrivateMode(mode int, active bool) {
 	case 7:
 		p.screen.SetAutoWrap(active)
 	case 25:
-		p.screen.CursorVisible = active
+		if p.screen.CursorVisible != active {
+			p.screen.markDirty()
+			p.screen.CursorVisible = active
+		}
 	case 1049:
 		if active {
-			p.screen.EnterAltScreen()
-		} else {
+			if !p.screen.altScreen {
+				p.altSavedG0LineDrawing = p.g0LineDrawing
+				p.altSavedG1LineDrawing = p.g1LineDrawing
+				p.altSavedUseG1 = p.useG1
+				p.altCharsetSaved = true
+				p.screen.EnterAltScreen()
+			}
+		} else if p.screen.altScreen {
 			p.screen.ExitAltScreen()
+			if p.altCharsetSaved {
+				p.g0LineDrawing = p.altSavedG0LineDrawing
+				p.g1LineDrawing = p.altSavedG1LineDrawing
+				p.useG1 = p.altSavedUseG1
+			}
+			p.altCharsetSaved = false
 		}
 	case 1000:
 		p.screen.mouseMode1000 = active
@@ -678,6 +713,136 @@ func (p *Parser) clearFromCursor() {
 	p.screen.clearCellRange(row, col, p.screen.Cols)
 	for r := row + 1; r < p.screen.Rows; r++ {
 		p.screen.fillBlank(p.screen.Cells[r], 0, p.screen.Cols)
+	}
+}
+
+func (p *Parser) handleSGRSequence(rawParams string) {
+	if !strings.Contains(rawParams, ":") {
+		p.handleSGR(parseParams(rawParams))
+		return
+	}
+	groups := strings.Split(rawParams, ";")
+	for i := 0; i < len(groups); {
+		rawGroup := groups[i]
+		if !strings.Contains(rawGroup, ":") {
+			params := parseParams(rawGroup)
+			if len(params) == 0 {
+				p.handleSGR(nil)
+				i++
+				continue
+			}
+			code := params[0]
+			if code == 38 || code == 48 {
+				if colorParams, consumed, ok := parseSemicolonSGRColor(groups, i, code); ok {
+					p.handleSGR(colorParams)
+					i += consumed + 1
+					continue
+				}
+			}
+			p.handleSGR(params)
+			i++
+			continue
+		}
+		fields := strings.Split(rawGroup, ":")
+		code := 0
+		if fields[0] != "" {
+			parsed, err := strconv.Atoi(fields[0])
+			if err != nil {
+				i++
+				continue
+			}
+			code = parsed
+		}
+		if code == 38 || code == 48 {
+			color, ok := parseColonSGRColor(fields)
+			if ok {
+				if code == 38 {
+					p.screen.Cursor.FG = color
+				} else {
+					p.screen.Cursor.BG = color
+				}
+			}
+			i++
+			continue
+		}
+		p.handleSGR([]int{code})
+		i++
+	}
+}
+
+func parseSemicolonSGRColor(groups []string, index, code int) ([]int, int, bool) {
+	if index+2 >= len(groups) {
+		return nil, 0, false
+	}
+	mode, err := strconv.Atoi(groups[index+1])
+	if err != nil {
+		return nil, 0, false
+	}
+	switch mode {
+	case 5:
+		value, err := strconv.Atoi(groups[index+2])
+		if err != nil || value < 0 || value > 255 {
+			return nil, 0, false
+		}
+		return []int{code, mode, value}, 2, true
+	case 2:
+		if index+4 >= len(groups) {
+			return nil, 0, false
+		}
+		params := []int{code, mode}
+		for _, raw := range groups[index+2 : index+5] {
+			value, err := strconv.Atoi(raw)
+			if err != nil || value < 0 || value > 255 {
+				return nil, 0, false
+			}
+			params = append(params, value)
+		}
+		return params, 4, true
+	default:
+		return nil, 0, false
+	}
+}
+
+func parseColonSGRColor(fields []string) (lipgloss.Color, bool) {
+	if len(fields) < 3 {
+		return "", false
+	}
+	mode, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return "", false
+	}
+	switch mode {
+	case 5:
+		if len(fields) != 3 {
+			return "", false
+		}
+		value, err := strconv.Atoi(fields[2])
+		if err != nil || value < 0 || value > 255 {
+			return "", false
+		}
+		return ansi256Color(value), true
+	case 2:
+		start := 2
+		if len(fields) == 6 {
+			if fields[2] != "" && fields[2] != "0" {
+				return "", false
+			}
+			start = 3
+		}
+		if len(fields) != start+3 {
+			return "", false
+		}
+		channels := [3]int{}
+		for i := range channels {
+			value, err := strconv.Atoi(fields[start+i])
+			if err != nil || value < 0 || value > 255 {
+				return "", false
+			}
+			channels[i] = value
+		}
+		return lipgloss.Color(rgb(channels[0], channels[1], channels[2])), true
+	default:
+		return "", false
 	}
 }
 

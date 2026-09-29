@@ -22,6 +22,8 @@ const asciiArtIcon = `
    \______/
 `
 
+const maxCommandHistory = 1000
+
 // ResizeMsg is sent by a host when the emulator's allocated rectangle changes.
 // It carries the content size in cells (without borders or padding).
 type ResizeMsg struct {
@@ -43,8 +45,10 @@ type Emulator struct {
 	pty     *Pty
 	focused bool
 
-	width  int
-	height int
+	width            int
+	height           int
+	resizeGeneration uint64
+	resizeMu         sync.Mutex
 
 	// stopped indicates the underlying session has been terminated and the
 	// panel should show the idle ASCII art icon instead of terminal output.
@@ -58,7 +62,9 @@ type Emulator struct {
 	// commandHistory holds commands entered in this terminal.
 	commandHistory []string
 
-	// Callbacks invoked when cwd or command history changes.
+	// Callbacks run outside mu and may re-enter the Emulator.
+	// OnCWDChange and OnCommandHistoryChanged report state changes; OnError
+	// reports PTY and clipboard errors.
 	OnCWDChange             func(string)
 	OnCommandHistoryChanged func([]string)
 	OnError                 func(error)
@@ -73,7 +79,8 @@ type Emulator struct {
 	startEnv []string
 
 	// scrollbackLimit caps the screen scrollback buffer.
-	scrollbackLimit int
+	scrollbackLimit    int
+	scrollbackLimitSet bool
 
 	// listenerPending prevents multiple Bubble Tea commands from reading the
 	// same PTY output channel concurrently.
@@ -87,6 +94,7 @@ type Emulator struct {
 	pressX, pressY int
 	dragSelecting  bool
 	tempFiles      []string
+	readClipboard  func() (string, string, error)
 
 	mu sync.RWMutex
 }
@@ -107,6 +115,8 @@ func NewEmulator(sessionID, chatName, command string, args []string) *Emulator {
 		ChatName:  chatName,
 		cmd:       command,
 		args:      append([]string(nil), args...),
+		width:     defaultTerminalCols,
+		height:    defaultTerminalRows,
 	}
 }
 
@@ -142,12 +152,13 @@ func (e *Emulator) effectiveEnv(extraEnv []string) []string {
 }
 
 // SetScrollbackLimit sets the maximum number of scrollback lines. Non-positive
-// values disable the limit. Call before Start to take effect; calling after
-// Start updates the existing screen immediately.
+// values disable the line-count limit; the Screen cell-count cap remains active.
+// Call before Start or update the existing screen immediately after Start.
 func (e *Emulator) SetScrollbackLimit(limit int) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	e.scrollbackLimit = limit
+	e.scrollbackLimitSet = true
 	if e.screen != nil {
 		e.screen.SetScrollbackLimit(limit)
 	}
@@ -171,9 +182,10 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 	args := append([]string(nil), e.args...)
 	initialCWD := e.initialCWD
 	sessionID := e.SessionID
+	rows, cols := e.height, e.width
 	e.mu.Unlock()
 
-	pty, err := spawnPtyConfig(command, args, initialCWD, sessionID, env)
+	pty, err := spawnPtyConfig(command, args, initialCWD, sessionID, rows, cols, env)
 	if err != nil {
 		e.mu.Lock()
 		if lifecycle == e.lifecycleGeneration && generation == e.listenerGeneration {
@@ -182,6 +194,7 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 		e.mu.Unlock()
 		return err
 	}
+	pty.setWriteGeneration(generation)
 
 	e.mu.Lock()
 	if lifecycle != e.lifecycleGeneration || generation != e.listenerGeneration || e.pty != nil {
@@ -190,21 +203,24 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 		return fmt.Errorf("start cancelled")
 	}
 	e.pty = pty
-	width, height := e.width, e.height
 	e.mu.Unlock()
 
-	if width > 0 && height > 0 {
-		if err := pty.Resize(height, width); err != nil {
-			e.mu.Lock()
-			if e.pty == pty && e.listenerGeneration == generation {
-				e.pty = nil
-				e.listenerGeneration++
-				e.stopped = true
-			}
-			e.mu.Unlock()
-			_ = pty.Close()
-			return fmt.Errorf("resize pty: %w", err)
+	current, err := e.resizeAttachedPTY(pty, generation)
+	if err != nil {
+		e.mu.Lock()
+		if e.pty == pty && e.listenerGeneration == generation {
+			pty.invalidateWrites()
+			e.pty = nil
+			e.listenerGeneration++
+			e.stopped = true
 		}
+		e.mu.Unlock()
+		_ = pty.Close()
+		return fmt.Errorf("resize pty: %w", err)
+	}
+	if !current {
+		_ = pty.Close()
+		return fmt.Errorf("start cancelled")
 	}
 	return nil
 }
@@ -236,12 +252,14 @@ func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
 		args := append([]string(nil), e.args...)
 		initialCWD := e.initialCWD
 		sessionID := e.SessionID
+		rows, cols := e.height, e.width
 		e.mu.Unlock()
 
-		pty, err := spawnPtyConfig(command, args, initialCWD, sessionID, env)
+		pty, err := spawnPtyConfig(command, args, initialCWD, sessionID, rows, cols, env)
 		if err != nil {
 			return PtyExitMsg{SessionID: sessionID, Generation: generation, Err: err}
 		}
+		pty.setWriteGeneration(generation)
 
 		e.mu.Lock()
 		if lifecycle != e.lifecycleGeneration || generation != e.listenerGeneration || e.pty != nil {
@@ -250,19 +268,23 @@ func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
 			return nil
 		}
 		e.pty = pty
-		width, height := e.width, e.height
 		e.mu.Unlock()
 
-		if width > 0 && height > 0 {
-			if err := pty.Resize(height, width); err != nil {
-				e.mu.Lock()
-				if e.pty == pty && e.listenerGeneration == generation {
-					e.pty = nil
-				}
-				e.mu.Unlock()
-				_ = pty.Close()
-				return PtyExitMsg{SessionID: sessionID, Generation: generation, Err: fmt.Errorf("resize pty: %w", err)}
+		current, err := e.resizeAttachedPTY(pty, generation)
+		if err != nil {
+			e.mu.Lock()
+			if e.pty == pty && e.listenerGeneration == generation {
+				pty.invalidateWrites()
+				e.pty = nil
+				e.listenerGeneration++
 			}
+			e.mu.Unlock()
+			_ = pty.Close()
+			return PtyExitMsg{SessionID: sessionID, Generation: generation, Err: fmt.Errorf("resize pty: %w", err)}
+		}
+		if !current {
+			_ = pty.Close()
+			return nil
 		}
 		return PtyReadyMsg{SessionID: sessionID, Generation: generation}
 	}
@@ -275,8 +297,12 @@ func (e *Emulator) resetTerminalLocked() {
 	e.pendingResponses = nil
 	e.listenerPending = false
 	e.listenerGeneration++
-	e.screen = NewScreen(24, 80)
-	if e.scrollbackLimit != 0 {
+	rows, cols := e.height, e.width
+	if validateTerminalSize(rows, cols) != nil {
+		rows, cols = defaultTerminalRows, defaultTerminalCols
+	}
+	e.screen = NewScreen(rows, cols)
+	if e.scrollbackLimitSet {
 		e.screen.SetScrollbackLimit(e.scrollbackLimit)
 	}
 	e.parser = NewParser(e.screen)
@@ -302,7 +328,7 @@ func envValue(extraEnv []string, key string) (string, bool) {
 	return os.LookupEnv(key)
 }
 
-func spawnPtyConfig(command string, args []string, initialCWD, sessionID string, extraEnv []string) (*Pty, error) {
+func spawnPtyConfig(command string, args []string, initialCWD, sessionID string, rows, cols int, extraEnv []string) (*Pty, error) {
 	env := append([]string{"AUTOMATA_SESSION_ID=" + sessionID}, extraEnv...)
 
 	// Bash OSC 7 emitter. PWD is percent-encoded byte-by-byte before it is
@@ -316,10 +342,7 @@ func spawnPtyConfig(command string, args []string, initialCWD, sessionID string,
 		env = append(env, "PROMPT_COMMAND="+osc7Cmd)
 	}
 
-	if initialCWD != "" {
-		return SpawnInDir(command, args, initialCWD, env...)
-	}
-	return Spawn(command, args, env...)
+	return spawnPtyWithSize(command, args, initialCWD, rows, cols, env...)
 }
 
 // Listen returns a command that waits for the next PTY output.
@@ -426,8 +449,8 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 	case CursorBlinkMsg:
 		e.mu.Lock()
 		if e.screen != nil {
-			e.screen.CursorBlinkVisible = !e.screen.CursorBlinkVisible
 			e.screen.markDirty()
+			e.screen.CursorBlinkVisible = !e.screen.CursorBlinkVisible
 		}
 		e.mu.Unlock()
 		return nil
@@ -463,7 +486,7 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		}
 		reply := func() tea.Msg {
 			for _, data := range responses {
-				if err := pty.Write(data); err != nil {
+				if err := pty.WriteForGeneration(generation, data); err != nil {
 					return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
 				}
 			}
@@ -484,6 +507,9 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 			return nil
 		}
 		pty := e.pty
+		if pty != nil {
+			pty.invalidateWrites()
+		}
 		e.pty = nil
 		e.listenerPending = false
 		e.listenerGeneration++
@@ -547,11 +573,10 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 		line := e.screen.LineText(e.screen.Cursor.Row)
 		cmd := stripPrompt(line)
 		if cmd != "" && (len(e.commandHistory) == 0 || e.commandHistory[len(e.commandHistory)-1] != cmd) {
-			const maxHistory = 1000
 			e.commandHistory = append(e.commandHistory, cmd)
 			historyChanged = true
-			if len(e.commandHistory) > maxHistory {
-				e.commandHistory = e.commandHistory[len(e.commandHistory)-maxHistory:]
+			if len(e.commandHistory) > maxCommandHistory {
+				e.commandHistory = e.commandHistory[len(e.commandHistory)-maxCommandHistory:]
 			}
 		}
 	}
@@ -568,9 +593,8 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 		onHistoryChanged(history)
 	}
 
-	// Write synchronously to preserve keystroke order. Async tea.Cmd
-	// execution can reorder rapid successive key messages.
-	if err := pty.Write(data); err != nil {
+	// Queue synchronously to preserve keystroke order before returning to Bubble Tea.
+	if err := pty.WriteForGeneration(generation, data); err != nil {
 		return func() tea.Msg {
 			return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
 		}
@@ -592,30 +616,6 @@ func stripPrompt(line string) string {
 		return strings.TrimSpace(line)
 	}
 	return strings.TrimSpace(line[best:])
-}
-
-func (e *Emulator) scrollUp(lines int) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.screen != nil {
-		e.screen.ScrollViewUp(lines)
-	}
-}
-
-func (e *Emulator) scrollDown(lines int) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.screen != nil {
-		e.screen.ScrollViewDown(lines)
-	}
-}
-
-func (e *Emulator) resetView() {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.screen != nil {
-		e.screen.ResetView()
-	}
 }
 
 func isMouseButtonDown(button tea.MouseButton) bool {
@@ -673,7 +673,7 @@ func (e *Emulator) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		if len(data) == 0 {
 			return nil
 		}
-		if err := pty.Write(data); err != nil {
+		if err := pty.WriteForGeneration(generation, data); err != nil {
 			return func() tea.Msg {
 				return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
 			}
@@ -697,6 +697,7 @@ func (e *Emulator) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	}
 
 	var copyLines []string
+	var copyErr error
 	switch msg.Action {
 	case tea.MouseActionPress:
 		if msg.Button == tea.MouseButtonLeft {
@@ -726,7 +727,7 @@ func (e *Emulator) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	case tea.MouseActionRelease:
 		if msg.Button == tea.MouseButtonLeft || msg.Button == tea.MouseButtonNone {
 			if e.dragSelecting {
-				copyLines = screen.SelectionText()
+				copyLines, copyErr = screen.selectionTextWithLimit(maxClipboardBytes, maxClipboardCells)
 				screen.ClearSelection()
 			}
 			e.dragSelecting = false
@@ -734,6 +735,9 @@ func (e *Emulator) handleMouse(msg tea.MouseMsg) tea.Cmd {
 	}
 	e.mu.Unlock()
 
+	if copyErr != nil {
+		return func() tea.Msg { return ClipboardErrorMsg{Err: copyErr} }
+	}
 	if len(copyLines) == 0 {
 		return nil
 	}
@@ -819,26 +823,81 @@ func (e *Emulator) handleResize(msg tea.WindowSizeMsg) tea.Cmd {
 }
 
 func (e *Emulator) handlePanelResize(msg ResizeMsg) tea.Cmd {
-	if msg.Width <= 0 || msg.Height <= 0 {
+	if err := validateTerminalSize(msg.Height, msg.Width); err != nil {
 		return nil
 	}
 	e.mu.Lock()
-	e.width = msg.Width
-	e.height = msg.Height
-	if e.screen != nil {
-		e.screen.Resize(msg.Height, msg.Width)
+	if err := e.updateTerminalSizeLocked(msg.Height, msg.Width); err != nil {
+		e.mu.Unlock()
+		return nil
 	}
 	pty := e.pty
 	generation := e.listenerGeneration
 	e.mu.Unlock()
 	if pty != nil {
-		if err := pty.Resize(msg.Height, msg.Width); err != nil {
+		current, err := e.resizeAttachedPTY(pty, generation)
+		if err != nil {
 			return func() tea.Msg {
 				return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
 			}
 		}
+		if !current {
+			return nil
+		}
 	}
 	return nil
+}
+
+func (e *Emulator) updateTerminalSizeLocked(rows, cols int) error {
+	if err := validateTerminalSize(rows, cols); err != nil {
+		return err
+	}
+	if e.height == rows && e.width == cols {
+		return nil
+	}
+	if e.screen != nil {
+		if err := e.screen.ResizeChecked(rows, cols); err != nil {
+			return err
+		}
+	}
+	e.height = rows
+	e.width = cols
+	e.resizeGeneration++
+	return nil
+}
+
+func (e *Emulator) resizeAttachedPTY(pty *Pty, generation uint64) (bool, error) {
+	e.resizeMu.Lock()
+	defer e.resizeMu.Unlock()
+
+	for {
+		e.mu.RLock()
+		if e.pty != pty || e.listenerGeneration != generation {
+			e.mu.RUnlock()
+			return false, nil
+		}
+		rows, cols := e.height, e.width
+		resizeGeneration := e.resizeGeneration
+		e.mu.RUnlock()
+
+		if err := validateTerminalSize(rows, cols); err != nil {
+			return true, err
+		}
+		if err := pty.Resize(rows, cols); err != nil {
+			return true, err
+		}
+
+		e.mu.RLock()
+		current := e.pty == pty && e.listenerGeneration == generation
+		changed := e.resizeGeneration != resizeGeneration
+		e.mu.RUnlock()
+		if !current {
+			return false, nil
+		}
+		if !changed {
+			return true, nil
+		}
+	}
 }
 
 func (e *Emulator) focusChanged(focused bool) tea.Cmd {
@@ -856,7 +915,7 @@ func (e *Emulator) focusChanged(focused bool) tea.Cmd {
 		data = []byte("\x1b[I")
 	}
 	return func() tea.Msg {
-		if err := pty.Write(data); err != nil {
+		if err := pty.WriteForGeneration(generation, data); err != nil {
 			return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
 		}
 		return nil
@@ -879,6 +938,9 @@ func (e *Emulator) Blur() tea.Cmd {
 func (e *Emulator) Close() error {
 	e.mu.Lock()
 	pty := e.pty
+	if pty != nil {
+		pty.invalidateWrites()
+	}
 	tempFiles := append([]string(nil), e.tempFiles...)
 	e.tempFiles = nil
 	e.pty = nil
@@ -902,6 +964,9 @@ func (e *Emulator) Close() error {
 func (e *Emulator) Stop() error {
 	e.mu.Lock()
 	pty := e.pty
+	if pty != nil {
+		pty.invalidateWrites()
+	}
 	tempFiles := append([]string(nil), e.tempFiles...)
 	e.tempFiles = nil
 	e.pty = nil
@@ -940,10 +1005,14 @@ func (e *Emulator) CWD() string {
 	return e.initialCWD
 }
 
-// SetCommandHistory restores a previously saved command history.
+// SetCommandHistory restores a previously saved command history, keeping only
+// the newest maxCommandHistory entries.
 func (e *Emulator) SetCommandHistory(history []string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	if len(history) > maxCommandHistory {
+		history = history[len(history)-maxCommandHistory:]
+	}
 	e.commandHistory = append([]string(nil), history...)
 }
 
@@ -1151,9 +1220,6 @@ func tildeKeySequence(code, modifier int) []byte {
 // A single host-level timer should broadcast this message to all visible
 // terminal emulators so their cursors blink in sync.
 type CursorBlinkMsg struct{}
-
-// cursorBlinkMsg is the legacy internal name, kept as an alias for compatibility.
-type cursorBlinkMsg = CursorBlinkMsg
 
 // PtyReadyMsg is sent when the PTY is ready for listening.
 type PtyReadyMsg struct {
