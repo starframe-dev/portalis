@@ -147,19 +147,13 @@ Input Data → Parser.Feed() → CSI/OSC/SGR → Screen.Put() → Render
 | `SetInitialCWD(dir)` | Установить начальную директорию |
 | `SetCommandHistory(history)` | Восстановить историю команд |
 
-### Callbacks
+### Callbacks и snapshots
 
-| Callback | Описание |
-|----------|----------|
-| Поле `OnCWDChange func(string)` | Уведомляет о смене рабочей директории |
-| Поле `OnCommandHistoryChanged func([]string)` | Уведомляет об изменении истории команд |
-| Поле `OnError func(error)` | Передаёт инфраструктурные и clipboard-ошибки host-приложению |
+Callbacks устанавливаются через `SetOnCWDChange`, `SetOnTitleChange`, `SetOnCommandHistoryChanged`, `SetOnError` и `SetOnExit`. Они вызываются после снятия `Emulator.mu` и могут повторно вызывать методы эмулятора. OSC 7 передаёт `WorkingDirectory{Host, Path, Local}`; OSC 0/2 устанавливает terminal title.
 
-Внешние callbacks вызываются после снятия `Emulator.mu`, поэтому могут повторно
-вызывать методы эмулятора. История ограничена последними 1000 командами; при
-`SetCommandHistory` более старые элементы отбрасываются. Аргументы конструктора,
-`StartEnv()` и восстановленная история копируются, чтобы вызывающий код не мог
-изменять внутренние срезы.
+Идентификаторы читаются через `SessionID()`/`ChatName()`, состояние PTY — через `PtyState()`. `CWD()` возвращает только путь; для remote/local authority используйте `CurrentWorkingDirectory()`. `CommandHistorySnapshot()` возвращает копию списка. История команды эвристически извлекается с видимой строки перед prompt и не является shell history; список ограничен 1000 записями.
+
+Аргументы конструктора, `StartEnv()` и восстановленная история копируются, чтобы вызывающий код не мог изменять внутренние срезы.
 
 ### Screen
 
@@ -284,9 +278,9 @@ Emulator использует Bubble Tea для обработки событи�
 
 ## Безопасность
 
-1. Ошибки запуска, записи и завершения PTY передаются вызывающему коду; ошибки записи необязательного raw trace намеренно игнорируются.
+1. Ошибки запуска, записи и завершения PTY передаются вызывающему коду; bounded raw trace errors идут как non-fatal `PtyWarningMsg`/`SetOnError`.
 2. PTY проверяется на закрытие перед операциями; дочерний процесс завершается при закрытии.
-3. Clipboard temp-файлы создаются с правами `0600` и удаляются при `Stop`/`Close` либо сразу при ошибке/устаревшей сессии.
+3. Clipboard temp-файлы создаются с правами `0600` в private per-Emulator directory `0700`, ограниченной количеством/байтами/TTL; удаляются при `Stop`/`Close` либо при ошибке/устаревшей сессии.
 4. Clipboard subprocess ограничен 5 секундами и выводом 100 MiB; PNG до decode ограничен 25 000 000 пикселями.
 5. Сканирование clipboard selection ограничено 4 Mi ячейками и выводом 100 MiB.
 
@@ -299,9 +293,9 @@ Emulator использует Bubble Tea для обработки событи�
 ## Примечания
 
 - PTY поддерживается на Unix-подобных системах Linux и macOS; Windows не поддерживается.
-- Clipboard image-файлы отслеживаются Emulator и удаляются при `Stop`/`Close`.
+- Clipboard image-файлы отслеживаются Emulator и удаляются при `Stop`/`Close`; Wayland читает только объявленные MIME types.
 - Swift используется для чтения изображений из clipboard macOS.
-- PTY получает `TERM=xterm-256color`, если вызывающий код не переопределил значение.
+- PTY получает `TERM=ansi` по умолчанию, если вызывающий код не переопределил значение. Полный ANSI/VT и printer controls `mc4/mc5` не обещаются.
 - PTY output читается через `bufio.Reader` небольшими упорядоченными chunks.
 
 ## Связанные спецификации

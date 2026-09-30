@@ -21,9 +21,11 @@ type Parser struct {
 	state                 ansiState
 	buf                   strings.Builder
 	utf8Buf               []byte
-	onCWD                 func(string)
+	onCWD                 func(WorkingDirectory)
+	onTitle               func(string)
 	onResponse            func([]byte)
-	lastCWD               string
+	lastCWD               WorkingDirectory
+	lastTitle             string
 	escapeIntermediate    byte
 	g0LineDrawing         bool
 	g1LineDrawing         bool
@@ -59,10 +61,23 @@ func NewParser(screen *Screen) *Parser {
 	return &Parser{screen: screen}
 }
 
+// WorkingDirectory is a validated OSC 7 location. Host is preserved for remote
+// file URLs; Local reports whether Path belongs to this machine.
+type WorkingDirectory struct {
+	Host  string
+	Path  string
+	Local bool
+}
+
 // SetCWDCallback sets a callback invoked synchronously by Feed for OSC 7 changes.
 // The callback must return promptly and must not re-enter the parser.
-func (p *Parser) SetCWDCallback(fn func(string)) {
+func (p *Parser) SetCWDCallback(fn func(WorkingDirectory)) {
 	p.onCWD = fn
+}
+
+// SetTitleCallback receives OSC 0/2 titles synchronously during Feed.
+func (p *Parser) SetTitleCallback(fn func(string)) {
+	p.onTitle = fn
 }
 
 // SetResponseCallback receives terminal-generated replies synchronously during
@@ -91,6 +106,42 @@ func (p *Parser) restoreCursorState() {
 	p.g0LineDrawing = p.savedG0LineDrawing
 	p.g1LineDrawing = p.savedG1LineDrawing
 	p.useG1 = p.savedUseG1
+}
+
+// Reset restores power-on screen and parser state at the current dimensions.
+func (p *Parser) Reset() {
+	p.screen.Reset()
+	p.resetCharsets()
+	p.state = stateNormal
+	p.buf.Reset()
+	p.utf8Buf = nil
+	p.escapeIntermediate = 0
+	p.lastCWD = WorkingDirectory{}
+	p.lastTitle = ""
+}
+
+func (p *Parser) resetCharsets() {
+	p.g0LineDrawing = false
+	p.g1LineDrawing = false
+	p.useG1 = false
+	p.savedG0LineDrawing = false
+	p.savedG1LineDrawing = false
+	p.savedUseG1 = false
+	p.altSavedG0LineDrawing = false
+	p.altSavedG1LineDrawing = false
+	p.altSavedUseG1 = false
+	p.altCharsetSaved = false
+}
+
+func (p *Parser) softReset() {
+	p.screen.SoftReset()
+	p.resetCharsets()
+	p.state = stateNormal
+	p.buf.Reset()
+	p.utf8Buf = nil
+	p.escapeIntermediate = 0
+	p.lastCWD = WorkingDirectory{}
+	p.lastTitle = ""
 }
 
 // flushUtf8 flushes any incomplete UTF-8 sequence as replacement chars.
@@ -160,7 +211,7 @@ func (p *Parser) feedByte(b byte) {
 		if b == '\r' {
 			p.flushUtf8()
 			p.screen.markDirty()
-			p.screen.Cursor.Col = 0
+			p.screen.cursor.Col = 0
 			p.screen.wrapPending = false
 			return
 		}
@@ -170,28 +221,23 @@ func (p *Parser) feedByte(b byte) {
 			// If a wrap is pending, LF behaves like CR+LF.
 			if p.screen.wrapPending {
 				p.screen.wrapPending = false
-				p.screen.Cursor.Col = 0
+				p.screen.cursor.Col = 0
 			}
 			p.screen.Index()
 			return
 		}
 		if b == '\t' {
 			p.flushUtf8()
-			p.screen.markDirty()
-			p.screen.wrapPending = false
-			next := (p.screen.Cursor.Col/8 + 1) * 8
-			if next >= p.screen.Cols {
-				next = p.screen.Cols - 1
-			}
-			p.screen.Cursor.Col = next
+			p.screen.ClearWrapPending()
+			p.screen.TabForward(1)
 			return
 		}
 		if b == '\b' {
 			p.flushUtf8()
 			p.screen.markDirty()
 			p.screen.wrapPending = false
-			if p.screen.Cursor.Col > 0 {
-				p.screen.Cursor.Col--
+			if p.screen.cursor.Col > 0 {
+				p.screen.cursor.Col--
 			}
 			return
 		}
@@ -269,6 +315,10 @@ func (p *Parser) feedByte(b byte) {
 			p.saveCursorState()
 		case '8':
 			p.restoreCursorState()
+		case 'H':
+			p.screen.SetTabStop()
+		case 'c':
+			p.Reset()
 		case 'P', 'X', '^', '_': // DCS, SOS, PM, APC: ignore until ST
 			p.state = stateString
 			return
@@ -361,47 +411,76 @@ func (p *Parser) handleOSC(payload string) {
 		return
 	}
 	parts := strings.SplitN(payload, ";", 2)
-	if len(parts) < 2 {
+	if len(parts) != 2 {
 		return
 	}
-	if parts[0] != "7" {
-		return
-	}
-	path := extractOSC7Path(parts[1])
-	if path != "" && path != p.lastCWD {
-		p.lastCWD = path
-		if p.onCWD != nil {
-			p.onCWD(path)
+	switch parts[0] {
+	case "0", "2":
+		title := sanitizeTerminalTitle(parts[1])
+		if title != "" && title != p.lastTitle {
+			p.lastTitle = title
+			if p.onTitle != nil {
+				p.onTitle(title)
+			}
+		}
+	case "7":
+		cwd, ok := parseOSC7WorkingDirectory(parts[1])
+		if ok && cwd != p.lastCWD {
+			p.lastCWD = cwd
+			if p.onCWD != nil {
+				p.onCWD(cwd)
+			}
 		}
 	}
 }
 
-// extractOSC7Path extracts an absolute local filesystem path from an OSC 7 payload.
-// file URLs are accepted only for an empty, loopback, or current-host authority.
-func extractOSC7Path(s string) string {
-	s = strings.TrimSpace(s)
-	var path string
-	if strings.HasPrefix(s, "file://") {
-		u, err := url.Parse(s)
-		if err != nil || u.Scheme != "file" || u.User != nil || u.Port() != "" ||
-			u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || !isLocalOSC7Host(u.Hostname()) {
-			return ""
-		}
-		path = u.Path
-		if !filepath.IsAbs(path) {
-			return ""
-		}
-	} else if filepath.IsAbs(s) {
-		path = s
-	} else {
+const maxTerminalTitleBytes = 4096
+
+func sanitizeTerminalTitle(title string) string {
+	if len(title) == 0 || len(title) > maxTerminalTitleBytes || !utf8.ValidString(title) {
 		return ""
+	}
+	for _, r := range title {
+		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
+			return ""
+		}
+	}
+	return title
+}
+
+func parseOSC7WorkingDirectory(raw string) (WorkingDirectory, bool) {
+	var host, path string
+	local := true
+	if strings.HasPrefix(strings.ToLower(raw), "file:") {
+		u, err := url.Parse(raw)
+		if err != nil || !strings.EqualFold(u.Scheme, "file") || u.Opaque != "" || u.User != nil || u.Port() != "" ||
+			u.RawQuery != "" || u.ForceQuery || u.Fragment != "" {
+			return WorkingDirectory{}, false
+		}
+		host = strings.ToLower(u.Hostname())
+		local = isLocalOSC7Host(host)
+		path = u.Path
+	} else {
+		path = raw
+	}
+	if !filepath.IsAbs(path) {
+		return WorkingDirectory{}, false
 	}
 	for _, r := range path {
 		if r == 0 || r == '\x1b' || r == '\x07' || r == '\r' || r == '\n' {
-			return ""
+			return WorkingDirectory{}, false
 		}
 	}
-	return path
+	return WorkingDirectory{Host: host, Path: path, Local: local}, true
+}
+
+// extractOSC7Path returns only local paths for legacy package-internal callers.
+func extractOSC7Path(raw string) string {
+	cwd, ok := parseOSC7WorkingDirectory(raw)
+	if !ok || !cwd.Local {
+		return ""
+	}
+	return cwd.Path
 }
 
 func isLocalOSC7Host(host string) bool {
@@ -520,13 +599,13 @@ func (p *Parser) handleCSI(seq string) {
 		if len(params) > 0 && params[0] > 0 {
 			col = params[0]
 		}
-		p.screen.SetCursor(p.screen.Cursor.Row, col-1)
+		p.screen.SetCursor(p.screen.cursor.Row, col-1)
 	case 'd':
 		row := 1
 		if len(params) > 0 && params[0] > 0 {
 			row = params[0]
 		}
-		p.screen.SetCursorAddress(row-1, p.screen.Cursor.Col)
+		p.screen.SetCursorAddress(row-1, p.screen.cursor.Col)
 	case '@':
 		p.screen.InsertChars(firstParam(params, 1))
 	case 'P':
@@ -541,6 +620,19 @@ func (p *Parser) handleCSI(seq string) {
 		p.screen.ScrollRegionUp(firstParam(params, 1))
 	case 'T':
 		p.screen.ScrollRegionDown(firstParam(params, 1))
+	case 'I':
+		if !isPrivate {
+			p.screen.ClearWrapPending()
+			p.screen.TabForward(firstParam(params, 1))
+		}
+	case 'Z':
+		if !isPrivate {
+			p.screen.TabBackward(firstParam(params, 1))
+		}
+	case 'g':
+		if !isPrivate {
+			p.screen.ClearTabStop(firstParam(params, 0))
+		}
 	case 's':
 		// Save cursor (DECSC) — only standard sequences.
 		if !isPrivate {
@@ -569,14 +661,14 @@ func (p *Parser) handleCSI(seq string) {
 		}
 	case 'c':
 		if privateMarker == '>' {
-			p.respond([]byte("\x1b[>0;1;0c"))
+			p.respond([]byte("\x1b[>0;0;0c"))
 		} else if !isPrivate {
 			p.respond([]byte("\x1b[?1;2c"))
 		}
 	case 'r':
 		// Set scroll region (DECSTBM)
 		top := 1
-		bottom := p.screen.Rows
+		bottom := p.screen.rows
 		if len(params) > 0 {
 			top = params[0]
 		}
@@ -589,12 +681,28 @@ func (p *Parser) handleCSI(seq string) {
 			for _, mode := range params {
 				p.setPrivateMode(mode, true)
 			}
+		} else {
+			for _, mode := range params {
+				if mode == 4 {
+					p.screen.SetInsertMode(true)
+				}
+			}
 		}
 	case 'l':
 		if isPrivate {
 			for _, mode := range params {
 				p.setPrivateMode(mode, false)
 			}
+		} else {
+			for _, mode := range params {
+				if mode == 4 {
+					p.screen.SetInsertMode(false)
+				}
+			}
+		}
+	case 'p':
+		if privateMarker == '!' {
+			p.softReset()
 		}
 	case '~':
 		// Bracketed-paste delimiters belong to terminal input. If an
@@ -625,27 +733,21 @@ func (p *Parser) setPrivateMode(mode int, active bool) {
 	case 7:
 		p.screen.SetAutoWrap(active)
 	case 25:
-		if p.screen.CursorVisible != active {
+		if p.screen.cursorVisible != active {
 			p.screen.markDirty()
-			p.screen.CursorVisible = active
+			p.screen.cursorVisible = active
 		}
-	case 1049:
+	case 1047, 1049:
 		if active {
-			if !p.screen.altScreen {
-				p.altSavedG0LineDrawing = p.g0LineDrawing
-				p.altSavedG1LineDrawing = p.g1LineDrawing
-				p.altSavedUseG1 = p.useG1
-				p.altCharsetSaved = true
-				p.screen.EnterAltScreen()
-			}
-		} else if p.screen.altScreen {
-			p.screen.ExitAltScreen()
-			if p.altCharsetSaved {
-				p.g0LineDrawing = p.altSavedG0LineDrawing
-				p.g1LineDrawing = p.altSavedG1LineDrawing
-				p.useG1 = p.altSavedUseG1
-			}
-			p.altCharsetSaved = false
+			p.enterAltScreen()
+		} else {
+			p.exitAltScreen()
+		}
+	case 1048:
+		if active {
+			p.saveCursorState()
+		} else {
+			p.restoreCursorState()
 		}
 	case 1000:
 		p.screen.mouseMode1000 = active
@@ -662,6 +764,30 @@ func (p *Parser) setPrivateMode(mode int, active bool) {
 	case 2026:
 		p.screen.SetSync(active)
 	}
+}
+
+func (p *Parser) enterAltScreen() {
+	if p.screen.altScreen {
+		return
+	}
+	p.altSavedG0LineDrawing = p.g0LineDrawing
+	p.altSavedG1LineDrawing = p.g1LineDrawing
+	p.altSavedUseG1 = p.useG1
+	p.altCharsetSaved = true
+	p.screen.EnterAltScreen()
+}
+
+func (p *Parser) exitAltScreen() {
+	if !p.screen.altScreen {
+		return
+	}
+	p.screen.ExitAltScreen()
+	if p.altCharsetSaved {
+		p.g0LineDrawing = p.altSavedG0LineDrawing
+		p.g1LineDrawing = p.altSavedG1LineDrawing
+		p.useG1 = p.altSavedUseG1
+	}
+	p.altCharsetSaved = false
 }
 
 func firstParam(params []int, defaultValue int) int {
@@ -708,11 +834,11 @@ func parseParams(s string) []int {
 }
 
 func (p *Parser) clearFromCursor() {
-	row := p.screen.Cursor.Row
-	col := p.screen.Cursor.Col
-	p.screen.clearCellRange(row, col, p.screen.Cols)
-	for r := row + 1; r < p.screen.Rows; r++ {
-		p.screen.fillBlank(p.screen.Cells[r], 0, p.screen.Cols)
+	row := p.screen.cursor.Row
+	col := p.screen.cursor.Col
+	p.screen.clearCellRange(row, col, p.screen.cols)
+	for r := row + 1; r < p.screen.rows; r++ {
+		p.screen.fillBlank(p.screen.cells[r], 0, p.screen.cols)
 	}
 }
 
@@ -757,9 +883,9 @@ func (p *Parser) handleSGRSequence(rawParams string) {
 			color, ok := parseColonSGRColor(fields)
 			if ok {
 				if code == 38 {
-					p.screen.Cursor.FG = color
+					p.screen.cursor.FG = color
 				} else {
-					p.screen.Cursor.BG = color
+					p.screen.cursor.BG = color
 				}
 			}
 			i++
@@ -854,67 +980,71 @@ func (p *Parser) handleSGR(params []int) {
 		code := params[i]
 		switch {
 		case code == 0:
-			p.screen.Cursor.FG = ""
-			p.screen.Cursor.BG = ""
-			p.screen.Cursor.Style = 0
+			p.screen.cursor.FG = ""
+			p.screen.cursor.BG = ""
+			p.screen.cursor.Style = 0
 		case code == 1:
-			p.screen.Cursor.Style |= StyleBold
+			p.screen.cursor.Style |= StyleBold
 		case code == 2:
-			p.screen.Cursor.Style |= StyleDim
+			p.screen.cursor.Style |= StyleDim
 		case code == 3:
-			p.screen.Cursor.Style |= StyleItalic
+			p.screen.cursor.Style |= StyleItalic
 		case code == 4:
-			p.screen.Cursor.Style |= StyleUnderline
+			p.screen.cursor.Style |= StyleUnderline
 		case code == 5:
-			p.screen.Cursor.Style |= StyleBlink
+			p.screen.cursor.Style |= StyleBlink
 		case code == 7:
-			p.screen.Cursor.Style |= StyleReverse
+			p.screen.cursor.Style |= StyleReverse
 		case code == 8:
-			p.screen.Cursor.Style |= StyleHidden
+			p.screen.cursor.Style |= StyleHidden
 		case code == 9:
-			p.screen.Cursor.Style |= StyleStrikethrough
+			p.screen.cursor.Style |= StyleStrikethrough
+		case code == 10:
+			p.useG1 = false
+		case code == 11:
+			p.useG1 = true
 		case code == 22:
-			p.screen.Cursor.Style &^= StyleBold | StyleDim
+			p.screen.cursor.Style &^= StyleBold | StyleDim
 		case code == 23:
-			p.screen.Cursor.Style &^= StyleItalic
+			p.screen.cursor.Style &^= StyleItalic
 		case code == 24:
-			p.screen.Cursor.Style &^= StyleUnderline
+			p.screen.cursor.Style &^= StyleUnderline
 		case code == 25:
-			p.screen.Cursor.Style &^= StyleBlink
+			p.screen.cursor.Style &^= StyleBlink
 		case code == 27:
-			p.screen.Cursor.Style &^= StyleReverse
+			p.screen.cursor.Style &^= StyleReverse
 		case code == 28:
-			p.screen.Cursor.Style &^= StyleHidden
+			p.screen.cursor.Style &^= StyleHidden
 		case code == 29:
-			p.screen.Cursor.Style &^= StyleStrikethrough
+			p.screen.cursor.Style &^= StyleStrikethrough
 		case code >= 30 && code <= 37:
-			p.screen.Cursor.FG = ansi256Color(code - 30)
+			p.screen.cursor.FG = ansi256Color(code - 30)
 		case code == 38:
 			if i+2 < len(params) && params[i+1] == 5 {
-				p.screen.Cursor.FG = ansi256Color(params[i+2])
+				p.screen.cursor.FG = ansi256Color(params[i+2])
 				i += 2
 			} else if i+4 < len(params) && params[i+1] == 2 {
-				p.screen.Cursor.FG = lipgloss.Color(rgb(params[i+2], params[i+3], params[i+4]))
+				p.screen.cursor.FG = lipgloss.Color(rgb(params[i+2], params[i+3], params[i+4]))
 				i += 4
 			}
 		case code == 39:
-			p.screen.Cursor.FG = ""
+			p.screen.cursor.FG = ""
 		case code >= 40 && code <= 47:
-			p.screen.Cursor.BG = ansi256Color(code - 40)
+			p.screen.cursor.BG = ansi256Color(code - 40)
 		case code == 48:
 			if i+2 < len(params) && params[i+1] == 5 {
-				p.screen.Cursor.BG = ansi256Color(params[i+2])
+				p.screen.cursor.BG = ansi256Color(params[i+2])
 				i += 2
 			} else if i+4 < len(params) && params[i+1] == 2 {
-				p.screen.Cursor.BG = lipgloss.Color(rgb(params[i+2], params[i+3], params[i+4]))
+				p.screen.cursor.BG = lipgloss.Color(rgb(params[i+2], params[i+3], params[i+4]))
 				i += 4
 			}
 		case code == 49:
-			p.screen.Cursor.BG = ""
+			p.screen.cursor.BG = ""
 		case code >= 90 && code <= 97:
-			p.screen.Cursor.FG = ansi256Color(code - 90 + 8)
+			p.screen.cursor.FG = ansi256Color(code - 90 + 8)
 		case code >= 100 && code <= 107:
-			p.screen.Cursor.BG = ansi256Color(code - 100 + 8)
+			p.screen.cursor.BG = ansi256Color(code - 100 + 8)
 		}
 	}
 }

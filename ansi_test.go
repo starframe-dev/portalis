@@ -13,11 +13,11 @@ func TestParserPut(t *testing.T) {
 	p := NewParser(s)
 	p.Feed([]byte("hello"))
 
-	if s.Cells[0][0].Rune != 'h' {
-		t.Errorf("expected 'h', got %c", s.Cells[0][0].Rune)
+	if s.cells[0][0].Rune != 'h' {
+		t.Errorf("expected 'h', got %c", s.cells[0][0].Rune)
 	}
-	if s.Cells[0][4].Rune != 'o' {
-		t.Errorf("expected 'o', got %c", s.Cells[0][4].Rune)
+	if s.cells[0][4].Rune != 'o' {
+		t.Errorf("expected 'o', got %c", s.cells[0][4].Rune)
 	}
 }
 
@@ -26,8 +26,8 @@ func TestParserCursor(t *testing.T) {
 	p := NewParser(s)
 	p.Feed([]byte("\x1b[3;5Hab"))
 
-	if s.Cells[2][4].Rune != 'a' {
-		t.Errorf("expected 'a' at row 3 col 5, got %c", s.Cells[2][4].Rune)
+	if s.cells[2][4].Rune != 'a' {
+		t.Errorf("expected 'a' at row 3 col 5, got %c", s.cells[2][4].Rune)
 	}
 }
 
@@ -36,8 +36,8 @@ func TestParserColor(t *testing.T) {
 	p := NewParser(s)
 	p.Feed([]byte("\x1b[31mred\x1b[0m"))
 
-	if s.Cells[0][0].FG != lipgloss.Color("#800000") {
-		t.Errorf("expected dark red fg, got %v", s.Cells[0][0].FG)
+	if s.cells[0][0].FG != lipgloss.Color("#800000") {
+		t.Errorf("expected dark red fg, got %v", s.cells[0][0].FG)
 	}
 }
 
@@ -47,7 +47,7 @@ func TestParserClear(t *testing.T) {
 	p.Feed([]byte("hello"))
 	p.Feed([]byte("\x1b[2J"))
 
-	if s.Cells[0][0].Rune != 0 {
+	if s.cells[0][0].Rune != 0 {
 		t.Error("expected screen cleared")
 	}
 }
@@ -57,8 +57,8 @@ func TestParserNewline(t *testing.T) {
 	p := NewParser(s)
 	p.Feed([]byte("hello\r\nworld"))
 
-	if s.Cells[1][0].Rune != 'w' {
-		t.Errorf("expected 'w' on second line, got %c", s.Cells[1][0].Rune)
+	if s.cells[1][0].Rune != 'w' {
+		t.Errorf("expected 'w' on second line, got %c", s.cells[1][0].Rune)
 	}
 }
 
@@ -68,16 +68,16 @@ func TestColonSeparatedSGRColors(t *testing.T) {
 	p.Feed([]byte("\x1b[38:2::12:34:56;48:5:196mA"))
 	p.Feed([]byte("\x1b[38:2:1:2:3;48:2:0:4:5:6mB"))
 
-	if got := s.Cells[0][0].FG; got != lipgloss.Color("#0c2238") {
+	if got := s.cells[0][0].FG; got != lipgloss.Color("#0c2238") {
 		t.Fatalf("colon RGB foreground = %q, want #0c2238", got)
 	}
-	if got := s.Cells[0][0].BG; got != lipgloss.Color("#ff0000") {
+	if got := s.cells[0][0].BG; got != lipgloss.Color("#ff0000") {
 		t.Fatalf("colon 256-color background = %q, want #ff0000", got)
 	}
-	if got := s.Cells[0][1].FG; got != lipgloss.Color("#010203") {
+	if got := s.cells[0][1].FG; got != lipgloss.Color("#010203") {
 		t.Fatalf("colon RGB without colorspace foreground = %q, want #010203", got)
 	}
-	if got := s.Cells[0][1].BG; got != lipgloss.Color("#040506") {
+	if got := s.cells[0][1].BG; got != lipgloss.Color("#040506") {
 		t.Fatalf("colon RGB colorspace background = %q, want #040506", got)
 	}
 }
@@ -99,15 +99,15 @@ func TestOSC7(t *testing.T) {
 	s := NewScreen(10, 40)
 	p := NewParser(s)
 
-	var cwd string
-	p.SetCWDCallback(func(path string) {
-		cwd = path
+	var cwd WorkingDirectory
+	p.SetCWDCallback(func(location WorkingDirectory) {
+		cwd = location
 	})
 
 	p.Feed([]byte("before\x1b]7;/Users/a/foo\x1b\\after"))
 
-	if cwd != "/Users/a/foo" {
-		t.Fatalf("cwd = %q, want /Users/a/foo", cwd)
+	if cwd.Path != "/Users/a/foo" || !cwd.Local || cwd.Host != "" {
+		t.Fatalf("cwd = %+v, want local /Users/a/foo", cwd)
 	}
 
 	text := s.Render()
@@ -239,7 +239,7 @@ func TestParserTmuxModesAndFrame(t *testing.T) {
 	if !s.bracketedPaste {
 		t.Fatal("bracketed paste mode was not enabled")
 	}
-	if !s.CursorVisible {
+	if !s.cursorVisible {
 		t.Fatal("cursor should be visible after DECSET ?25")
 	}
 	if got := s.RenderLine(0); got != "tmux            " {
@@ -267,7 +267,7 @@ func TestParserFlushesIncompleteUTF8BeforeASCII(t *testing.T) {
 	if len(p.utf8Buf) != 0 {
 		t.Fatalf("incomplete UTF-8 buffer retained %d bytes", len(p.utf8Buf))
 	}
-	if got := s.Cells[0][1].Rune; got != 'A' {
+	if got := s.cells[0][1].Rune; got != 'A' {
 		t.Fatalf("ASCII after incomplete UTF-8 = %q, want A", got)
 	}
 }
@@ -358,6 +358,34 @@ func TestOSC7PercentDecodedAndControlsRejected(t *testing.T) {
 	}
 }
 
+func TestOSC7PreservesRemoteAuthority(t *testing.T) {
+	cwd, ok := parseOSC7WorkingDirectory("file://build-host.example/work/project%20one")
+	if !ok || cwd.Local || cwd.Host != "build-host.example" || cwd.Path != "/work/project one" {
+		t.Fatalf("remote OSC 7 location = %+v, %v", cwd, ok)
+	}
+	local, ok := parseOSC7WorkingDirectory("/tmp/trailing ")
+	if !ok || local.Path != "/tmp/trailing " {
+		t.Fatalf("OSC 7 local path lost trailing space: %+v, %v", local, ok)
+	}
+	if got := extractOSC7Path("file://build-host.example/work/project"); got != "" {
+		t.Fatalf("legacy local-only extractor accepted remote path %q", got)
+	}
+}
+
+func TestOSC0And2TitleCallbacks(t *testing.T) {
+	parser := NewParser(NewScreen(1, 10))
+	var titles []string
+	parser.SetTitleCallback(func(title string) { titles = append(titles, title) })
+	parser.Feed([]byte("\x1b]0;Build 🛠\x07\x1b]2;Build 🛠\x1b\\"))
+	if len(titles) != 1 || titles[0] != "Build 🛠" {
+		t.Fatalf("title callbacks = %#v, want one validated title", titles)
+	}
+	parser.Feed([]byte("\x1b]2;bad\x1btitle\x07\x1b]2;\nInjected\x07"))
+	if len(titles) != 1 {
+		t.Fatalf("control-containing title was accepted: %#v", titles)
+	}
+}
+
 func TestDSRRepliesUseActualCursorAndSurviveSplitCSI(t *testing.T) {
 	s := NewScreen(6, 10)
 	p := NewParser(s)
@@ -390,9 +418,82 @@ func TestDeviceAttributesReplies(t *testing.T) {
 	p.SetResponseCallback(func(data []byte) { replies = append(replies, string(data)) })
 
 	p.Feed([]byte("\x1b[c\x1b[>c"))
-	want := []string{"\x1b[?1;2c", "\x1b[>0;1;0c"}
+	want := []string{"\x1b[?1;2c", "\x1b[>0;0;0c"}
 	if len(replies) != len(want) || replies[0] != want[0] || replies[1] != want[1] {
 		t.Fatalf("DA replies = %#v, want %#v", replies, want)
+	}
+}
+
+func TestParserTabStopsAndInsertMode(t *testing.T) {
+	screen := NewScreen(1, 16)
+	parser := NewParser(screen)
+	parser.Feed([]byte("\x1b[9G\x1b[0g\x1b[4G\x1bH\x1b[1G\t"))
+	if _, col := screen.CursorPos(); col != 3 {
+		t.Fatalf("custom tab stop moved cursor to %d, want 3", col)
+	}
+	parser.Feed([]byte("\x1b[3g\x1b[1G\t"))
+	if _, col := screen.CursorPos(); col != 15 {
+		t.Fatalf("tab with all stops cleared moved cursor to %d, want last column 15", col)
+	}
+	parser.Feed([]byte("\x1b[1G\x1b[I"))
+	if _, col := screen.CursorPos(); col != 15 {
+		t.Fatalf("CSI I with all stops cleared moved cursor to %d, want last column 15", col)
+	}
+
+	screen = NewScreen(1, 6)
+	parser = NewParser(screen)
+	parser.Feed([]byte("abcd\r\x1b[4hXY"))
+	if got := screen.LineText(0); got != "XYabcd" {
+		t.Fatalf("insert mode line = %q, want XYabcd", got)
+	}
+	parser.Feed([]byte("\x1b[4l\rZ"))
+	if got := screen.LineText(0); got != "ZYabcd" {
+		t.Fatalf("replace mode line = %q, want ZYabcd", got)
+	}
+}
+
+func TestDEC1047AlternateBufferAndDEC1048CursorSave(t *testing.T) {
+	screen := NewScreen(2, 8)
+	parser := NewParser(screen)
+	parser.Feed([]byte("main\x1b[?1047halt\x1b[?1047l"))
+	if screen.altScreen || screen.LineText(0) != "main" {
+		t.Fatalf("1047 did not restore main buffer: alt=%v line=%q", screen.altScreen, screen.LineText(0))
+	}
+
+	screen.SetCursor(0, 3)
+	parser.Feed([]byte("\x1b[?1048h\x1b[2;6H\x1b[?1048l"))
+	if row, col := screen.CursorPos(); row != 0 || col != 3 {
+		t.Fatalf("1048 restored cursor to (%d,%d), want (0,3)", row, col)
+	}
+}
+
+func TestANSITerminfoAlternateCharsetSGR(t *testing.T) {
+	screen := NewScreen(1, 4)
+	parser := NewParser(screen)
+	parser.Feed([]byte("\x1b)0\x1b[11mq\x1b[10mq"))
+	if got := screen.LineText(0); got != "─q" {
+		t.Fatalf("SGR alternate charset output = %q, want ─q", got)
+	}
+}
+
+func TestParserSoftResetAndRIS(t *testing.T) {
+	screen := NewScreen(2, 8)
+	parser := NewParser(screen)
+	parser.Feed([]byte("keep\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[4h\x1b[!p"))
+	if got := screen.LineText(0); got != "keep" {
+		t.Fatalf("DECSTR cleared text: %q", got)
+	}
+	if !screen.autoWrap || screen.bracketedPaste || !screen.cursorVisible || screen.insertMode {
+		t.Fatalf("DECSTR left terminal modes active: wrap=%v paste=%v cursor=%v insert=%v", screen.autoWrap, screen.bracketedPaste, screen.cursorVisible, screen.insertMode)
+	}
+
+	parser.Feed([]byte("\x1b[?2004h\x1b[?1049halt"))
+	parser.Feed([]byte("\x1bc"))
+	if screen.LineText(0) != "" || screen.altScreen || screen.bracketedPaste || !screen.cursorVisible {
+		t.Fatalf("RIS did not restore power-on state: line=%q alt=%v paste=%v cursor=%v", screen.LineText(0), screen.altScreen, screen.bracketedPaste, screen.cursorVisible)
+	}
+	if rows, cols := screen.Rows(), screen.Cols(); rows != 2 || cols != 8 {
+		t.Fatalf("RIS changed dimensions to %dx%d", rows, cols)
 	}
 }
 
@@ -478,10 +579,10 @@ func TestDECSCRestoresRenditionAndCharset(t *testing.T) {
 	p.Feed([]byte("\x1b[0m\x1b(B\x1b[2;5H"))
 	p.Feed([]byte("\x1b8q"))
 
-	if got := s.Cells[0][0].Rune; got != '─' {
+	if got := s.cells[0][0].Rune; got != '─' {
 		t.Fatalf("restored DEC charset rendered %q, want line drawing", got)
 	}
-	if got := s.Cells[0][0].FG; got != lipgloss.Color("#800000") {
+	if got := s.cells[0][0].FG; got != lipgloss.Color("#800000") {
 		t.Fatalf("restored SGR fg = %q, want dark red", got)
 	}
 }

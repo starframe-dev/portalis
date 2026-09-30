@@ -10,6 +10,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -17,10 +18,11 @@ import (
 )
 
 const (
-	maxClipboardBytes       = 100 << 20
-	maxClipboardCells       = 4 << 20
-	maxClipboardImagePixels = 25_000_000
-	clipboardCommandTimeout = 5 * time.Second
+	maxClipboardBytes             = 100 << 20
+	maxClipboardCells             = 4 << 20
+	maxClipboardImagePixels       = 25_000_000
+	maxClipboardImageDecodedBytes = 128 << 20
+	clipboardCommandTimeout       = 5 * time.Second
 )
 
 var errClipboardSwiftUnavailable = errors.New("swift clipboard reader unavailable")
@@ -140,15 +142,15 @@ func copyToClipboard(lines []string) error {
 // contains an image, it is saved to a temp file and the file path is
 // returned as `imagePath`. Otherwise the plain-text contents are
 // returned as `text`.
-func pasteFromClipboard() (text string, imagePath string, err error) {
+func pasteFromClipboard(tempDir string) (text string, imagePath string, err error) {
 	if _, err := exec.LookPath("pbpaste"); err == nil {
-		return pasteMac()
+		return pasteMac(tempDir)
 	}
 	if _, err := exec.LookPath("wl-paste"); err == nil {
-		return pasteWayland()
+		return pasteWayland(tempDir)
 	}
 	if _, err := exec.LookPath("xclip"); err == nil {
-		return pasteX11()
+		return pasteX11(tempDir)
 	}
 	return "", "", fmt.Errorf("no clipboard tool available")
 }
@@ -161,6 +163,7 @@ const clipboardImageSwift = `import Cocoa
 import Foundation
 
 let pb = NSPasteboard.general
+let tempDir = URL(fileURLWithPath: CommandLine.arguments[1], isDirectory: true)
 let candidates: [(NSPasteboard.PasteboardType, String)] = [
     (NSPasteboard.PasteboardType("public.png"), "png"),
     (NSPasteboard.PasteboardType("public.jpeg"), "jpg"),
@@ -173,14 +176,13 @@ for (t, ext) in candidates {
             print("ERR:clipboard image too large")
             exit(1)
         }
-        let url = FileManager.default.temporaryDirectory
-            .appendingPathComponent("portalis-paste-\(UUID().uuidString).\(ext)")
-        do {
-            try data.write(to: url)
-            print("PATH:\(url.path)")
-        } catch {
-            print("ERR:\(error)")
+        let url = tempDir.appendingPathComponent("portalis-paste-\(UUID().uuidString).\(ext)")
+        let attributes: [FileAttributeKey: Any] = [.posixPermissions: 0o600]
+        guard FileManager.default.createFile(atPath: url.path, contents: data, attributes: attributes) else {
+            print("ERR:could not create private clipboard image")
+            exit(1)
         }
+        print("PATH:\(url.path)")
         exit(0)
     }
 }
@@ -196,26 +198,13 @@ func clipboardImageSwiftScript() string {
 //     source app — Preview, screenshots, browsers, etc.).
 //  2. Fall back to pbpaste for text. pbpaste never returns raw image
 //     bytes, so the inline Swift path is the only reliable image read.
-func pasteMac() (string, string, error) {
-	path, imageErr := pasteMacImage()
+func pasteMac(tempDir string) (string, string, error) {
+	path, imageErr := pasteMacImage(tempDir)
 	if imageErr != nil && !errors.Is(imageErr, errClipboardSwiftUnavailable) {
 		return "", "", imageErr
 	}
 	if path != "" {
-		info, statErr := os.Stat(path)
-		if statErr != nil {
-			_ = os.Remove(path)
-			return "", "", statErr
-		}
-		if info.Size() <= 0 {
-			_ = os.Remove(path)
-			return "", "", fmt.Errorf("clipboard image file is empty")
-		}
-		if info.Size() > maxClipboardBytes {
-			_ = os.Remove(path)
-			return "", "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardBytes)
-		}
-		if err := os.Chmod(path, 0o600); err != nil {
+		if err := validatePrivateClipboardImage(path, tempDir); err != nil {
 			_ = os.Remove(path)
 			return "", "", err
 		}
@@ -225,24 +214,21 @@ func pasteMac() (string, string, error) {
 	if err != nil {
 		return "", "", err
 	}
-	// Defensive: if pbpaste ever does return raw bytes (e.g. external tool
-	// pipes the image straight to pbcopy), still detect by PNG header.
 	if len(out) >= 8 && bytes.HasPrefix(out, []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}) {
-		path, err := saveImageBytes(out)
-		if err == nil {
-			return "", path, nil
+		path, err := saveImageBytes(out, tempDir)
+		if err != nil {
+			return "", "", err
 		}
+		return "", path, nil
 	}
 	return string(out), "", nil
 }
 
-// pasteMacImage invokes the Swift clipboard reader via stdin and returns
-// the saved file path (or "" if no image is on the clipboard).
-func pasteMacImage() (string, error) {
+func pasteMacImage(tempDir string) (string, error) {
 	if _, err := exec.LookPath("swift"); err != nil {
 		return "", fmt.Errorf("%w: %v", errClipboardSwiftUnavailable, err)
 	}
-	out, commandErr := commandOutputLimited(clipboardImageSwiftScript(), "swift", "-")
+	out, commandErr := commandOutputLimited(clipboardImageSwiftScript(), "swift", "-", tempDir)
 	line := strings.TrimSpace(string(out))
 	if commandErr != nil && line == "" {
 		return "", commandErr
@@ -252,12 +238,33 @@ func pasteMacImage() (string, error) {
 		return "", parseErr
 	}
 	if commandErr != nil {
-		if path != "" {
+		if path != "" && filepath.Dir(filepath.Clean(path)) == filepath.Clean(tempDir) {
 			_ = os.Remove(path)
 		}
 		return "", commandErr
 	}
 	return path, nil
+}
+
+func validatePrivateClipboardImage(path, tempDir string) error {
+	cleanPath := filepath.Clean(path)
+	if filepath.Dir(cleanPath) != filepath.Clean(tempDir) {
+		return fmt.Errorf("clipboard image is outside the private session directory")
+	}
+	info, err := os.Lstat(cleanPath)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("clipboard image must be a private regular file")
+	}
+	if info.Size() <= 0 {
+		return fmt.Errorf("clipboard image file is empty")
+	}
+	if info.Size() > maxClipboardBytes {
+		return fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardBytes)
+	}
+	return nil
 }
 
 func parseClipboardImageSwiftOutput(out []byte) (string, error) {
@@ -277,31 +284,41 @@ func parseClipboardImageSwiftOutput(out []byte) (string, error) {
 	return "", fmt.Errorf("unexpected swift output: %q", line)
 }
 
-// pasteWayland uses wl-paste. Image transfer requires --type image/png.
-func pasteWayland() (string, string, error) {
-	// Try text first.
-	if out, err := commandOutputLimited("", "wl-paste", "--no-newline"); err == nil {
-		// Could be text or PNG bytes — check signature.
-		if len(out) >= 8 && bytes.HasPrefix(out, []byte{0x89, 'P', 'N', 'G', 0x0d, 0x0a, 0x1a, 0x0a}) {
-			path, err := saveImageBytes(out)
-			return "", path, err
-		}
-		return string(out), "", nil
-	}
-	// Try image.
-	out, err := commandOutputLimited("", "wl-paste", "--type", "image/png")
+// pasteWayland reads only MIME types explicitly offered by the clipboard.
+func pasteWayland(tempDir string) (string, string, error) {
+	typesData, err := commandOutputLimited("", "wl-paste", "--list-types")
 	if err != nil {
 		return "", "", err
 	}
-	path, err := saveImageBytes(out)
-	return "", path, err
+	mimeTypes := make(map[string]struct{})
+	for _, mimeType := range strings.Fields(string(typesData)) {
+		mimeTypes[mimeType] = struct{}{}
+	}
+	for _, mimeType := range []string{"text/plain;charset=utf-8", "text/plain", "UTF8_STRING", "STRING"} {
+		if _, ok := mimeTypes[mimeType]; !ok {
+			continue
+		}
+		out, err := commandOutputLimited("", "wl-paste", "--no-newline", "--type", mimeType)
+		if err != nil {
+			return "", "", err
+		}
+		return string(out), "", nil
+	}
+	if _, ok := mimeTypes["image/png"]; ok {
+		out, err := commandOutputLimited("", "wl-paste", "--no-newline", "--type", "image/png")
+		if err != nil {
+			return "", "", err
+		}
+		path, err := saveImageBytes(out, tempDir)
+		return "", path, err
+	}
+	return "", "", fmt.Errorf("clipboard offers no supported text or image/png MIME type")
 }
 
-// pasteX11 uses xclip -selection clipboard -o.
-func pasteX11() (string, string, error) {
+func pasteX11(tempDir string) (string, string, error) {
 	out, err := commandOutputLimited("", "xclip", "-selection", "clipboard", "-o", "-t", "image/png")
 	if err == nil && len(out) > 0 {
-		path, err := saveImageBytes(out)
+		path, err := saveImageBytes(out, tempDir)
 		return "", path, err
 	}
 	out, err = commandOutputLimited("", "xclip", "-selection", "clipboard", "-o")
@@ -314,14 +331,28 @@ func pasteX11() (string, string, error) {
 func validateClipboardImageConfig(config image.Config) error {
 	width, height := int64(config.Width), int64(config.Height)
 	if width <= 0 || height <= 0 || width > int64(maxClipboardImagePixels)/height {
-		return fmt.Errorf("clipboard image dimensions %dx%d exceed limit", config.Width, config.Height)
+		return fmt.Errorf("clipboard image dimensions %dx%d exceed the %d-pixel limit", config.Width, config.Height, maxClipboardImagePixels)
+	}
+	pixels := width * height
+	if pixels > int64(maxClipboardImageDecodedBytes/8) {
+		return fmt.Errorf("clipboard image decoded data exceeds %d bytes", maxClipboardImageDecodedBytes)
 	}
 	return nil
 }
 
-func saveImageBytes(data []byte) (string, error) {
+func saveImageBytes(data []byte, tempDir string) (string, error) {
 	if len(data) > maxClipboardBytes {
 		return "", fmt.Errorf("clipboard image exceeds %d bytes", maxClipboardBytes)
+	}
+	if tempDir == "" {
+		return "", fmt.Errorf("private clipboard directory is required")
+	}
+	dirInfo, err := os.Stat(tempDir)
+	if err != nil {
+		return "", err
+	}
+	if !dirInfo.IsDir() || dirInfo.Mode().Perm()&0o077 != 0 {
+		return "", fmt.Errorf("clipboard directory must be private")
 	}
 	config, _, err := image.DecodeConfig(bytes.NewReader(data))
 	if err != nil {
@@ -334,16 +365,11 @@ func saveImageBytes(data []byte) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	file, err := os.CreateTemp(os.TempDir(), "portalis-paste-*.png")
+	file, err := os.CreateTemp(tempDir, "portalis-paste-*.png")
 	if err != nil {
 		return "", err
 	}
 	path := file.Name()
-	if err := file.Chmod(0o600); err != nil {
-		_ = file.Close()
-		_ = os.Remove(path)
-		return "", err
-	}
 	if err := png.Encode(file, img); err != nil {
 		_ = file.Close()
 		_ = os.Remove(path)
@@ -363,6 +389,37 @@ type ClipboardErrorMsg struct {
 
 // PasteFromClipboard asynchronously reads the system clipboard and writes its
 // text (or an image temp-file path) to the current PTY.
+func (e *Emulator) SetClipboardTempPolicy(policy ClipboardTempPolicy) error {
+	if err := policy.validate(); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.clipboardTempStore != nil {
+		return fmt.Errorf("clipboard temp policy cannot change after the first paste")
+	}
+	e.clipboardPolicy = policy
+	return nil
+}
+
+func (e *Emulator) clipboardStoreFor(pty *Pty, generation uint64) (*clipboardTempStore, bool, error) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.pty != pty || e.listenerGeneration != generation {
+		return nil, false, nil
+	}
+	if e.clipboardTempStore == nil {
+		store, err := newClipboardTempStore(e.clipboardPolicy)
+		if err != nil {
+			return nil, true, err
+		}
+		e.clipboardTempStore = store
+	}
+	return e.clipboardTempStore, true, nil
+}
+
+// PasteFromClipboard asynchronously reads the system clipboard and writes its
+// text (or an image temp-file path) to the current PTY.
 func (e *Emulator) PasteFromClipboard() tea.Cmd {
 	e.mu.RLock()
 	pty := e.pty
@@ -377,9 +434,19 @@ func (e *Emulator) PasteFromClipboard() tea.Cmd {
 	}
 
 	return func() tea.Msg {
-		text, imagePath, err := readClipboard()
+		store, active, err := e.clipboardStoreFor(pty, generation)
 		if err != nil {
 			return ClipboardErrorMsg{Err: err}
+		}
+		if !active {
+			return nil
+		}
+		text, imagePath, err := readClipboard(store.directory())
+		if err != nil {
+			return ClipboardErrorMsg{Err: err}
+		}
+		if len(text) > maxClipboardBytes {
+			return ClipboardErrorMsg{Err: fmt.Errorf("clipboard text exceeds %d bytes", maxClipboardBytes)}
 		}
 		if text == "" && imagePath == "" {
 			return nil
@@ -391,9 +458,15 @@ func (e *Emulator) PasteFromClipboard() tea.Cmd {
 		e.mu.RUnlock()
 		if !current {
 			if imagePath != "" {
-				_ = os.Remove(imagePath)
+				_ = store.discard(imagePath)
 			}
 			return nil
+		}
+		if imagePath != "" {
+			if err := store.register(imagePath); err != nil {
+				_ = store.discard(imagePath)
+				return ClipboardErrorMsg{Err: err}
+			}
 		}
 
 		var payload []byte
@@ -405,20 +478,11 @@ func (e *Emulator) PasteFromClipboard() tea.Cmd {
 		} else {
 			payload = []byte(text)
 		}
-		if err := pty.WriteForGeneration(generation, payload); err != nil {
+		if err := pty.writeForGeneration(generation, payload); err != nil {
 			if imagePath != "" {
-				_ = os.Remove(imagePath)
+				_ = store.discard(imagePath)
 			}
-			return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
-		}
-		if imagePath != "" {
-			e.mu.Lock()
-			if e.pty == pty && e.listenerGeneration == generation {
-				e.tempFiles = append(e.tempFiles, imagePath)
-			} else {
-				_ = os.Remove(imagePath)
-			}
-			e.mu.Unlock()
+			return PtyExitMsg{SessionID: e.sessionID, Generation: generation, Err: err}
 		}
 		return nil
 	}

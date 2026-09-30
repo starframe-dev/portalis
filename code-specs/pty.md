@@ -30,15 +30,30 @@ if err != nil {
 defer pty.Close()
 ```
 
-Spawn задаёт `TERM=xterm-256color`; значение из caller-provided `env` имеет приоритет.
+Spawn задаёт `TERM=ansi`; явное значение из caller-provided `env` имеет приоритет. Это консервативная 8-color terminfo profile, не обещание полного ANSI/VT эмулятора. `mc4/mc5` printer controls и расширения вне документированного subset не поддерживаются.
 
 ### `SpawnInDir(command string, args []string, dir string, env ...string) (*Pty, error)`
 
 Запускает новую PTY-сессию в указанной рабочей директории.
 
-### `Write(data []byte) error` / `WriteForGeneration(generation uint64, data []byte) error`
+### `State() PtyState`
 
-Отправляет байты в PTY через одну упорядоченную очередь и одного writer worker. Admission order — порядок передачи данных в child; один payload полностью записывается до следующего. Размер очереди ограничен 64 запросами и 100 MiB суммарных незавершённых payload; один payload больше 100 MiB отвергается. Generation-aware вызовы отклоняют устаревшее поколение.
+Возвращает snapshot состояния без process/I/O handles:
+
+```go
+type PtyState struct {
+    Running bool
+    PID     int
+    Rows    int
+    Cols    int
+}
+```
+
+### `Write(data []byte) error`
+
+Отправляет байты в PTY через одну упорядоченную очередь и одного writer worker. Admission order — порядок передачи данных в child; один payload полностью записывается до следующего. Очередь ограничена 64 запросами и 100 MiB суммарных bulk payload; один payload больше 100 MiB отвергается. Внутренний generation-aware метод не является публичным API.
+
+Интерактивные клавиатурные и мышиные события используют отдельный reserve до 64 KiB и fail-fast admission: UI `Update` не ждёт PTY I/O, byte budget, queue lock или свободный slot. Перегрузка доставляется как нетерминальное `PtyErrorMsg`. Все accepted writes остаются в общем FIFO; paste payload с delimiters является одним атомарным запросом.
 
 ### `Resize(rows, cols int) error`
 
@@ -52,14 +67,15 @@ Spawn задаёт `TERM=xterm-256color`; значение из caller-provided 
 
 ### `Close() error`
 
-Закрывает PTY и убивает дочерний процесс.
+Закрывает PTY, отменяет enqueue, убивает дочерний процесс и дожидается завершения reader/writer goroutines. Операция идемпотентна.
 
 ### `Listen(sessionID string) tea.Cmd`
 
-Возвращает команду Bubble Tea, которая ждёт одно событие: следующий output chunk или завершение PTY. Продолжайте выполнять команды, возвращаемые `Emulator.Update`, до завершения PTY; используйте `Listen` как единственный serial consumer и не читайте параллельно `Output`/`Errors`.
+Возвращает команду Bubble Tea, которая ждёт одно событие: следующий output chunk, non-fatal warning или завершение PTY. Продолжайте выполнять команды, возвращаемые `Emulator.Update`, до завершения PTY; `Output`, `Errors` и raw handles не экспортируются.
 
 **События:**
 - `PtyOutputMsg` — один упорядоченный read chunk размером до 4 KiB
+- `PtyWarningMsg` — non-fatal diagnostic, например сбой записи raw trace; после него listener продолжается
 - `PtyExitMsg` — ошибка или нормальное завершение процесса
 
 **Примечание:** все уже прочитанные chunks выдаются до `PtyExitMsg`; EOF не может обогнать накопленный вывод.
@@ -70,17 +86,11 @@ Spawn задаёт `TERM=xterm-256color`; значение из caller-provided 
 
 Структура для управления PTY-сессией.
 
-**Поля:**
-- `Output chan []byte` и `Errors chan error` — каналы событий; используйте либо `Listen`, либо прямое чтение каналов, не оба варианта одновременно.
-- `cmd *exec.Cmd` — команда, запущенная в PTY
-- `ptmx *os.File` — файл PTY для чтения/записи
-- `reader *bufio.Reader` — буферизированный читатель для чтения
-- `Output chan []byte` — канал для выхода данных
-- `Errors chan error` — канал для ошибок
-- `done chan struct{}` — сигнал принудительного завершения
-- `readDone chan struct{}` — завершение read loop после дренирования вывода
-- `lastRows, lastCols int` — последние размеры окна
-- `setSize func(*os.File, *pty.Winsize) error` — инъекция для тестов (по умолчанию `pty.Setsize`)
+Все process, I/O и lifecycle поля приватны. `State() PtyState` выдаёт snapshot (`Running`, `PID`, `Rows`, `Cols`); поток событий читается через `Listen`.
+
+### `PtyWarningMsg`
+
+Non-fatal PTY diagnostic (например trace I/O failure). `Emulator` вызывает `SetOnError` и продолжает listener.
 
 ### `PtyOutputMsg`
 
@@ -122,12 +132,13 @@ Spawn задаёт `TERM=xterm-256color`; значение из caller-provided 
 ### Диагностическая запись raw PTY
 
 При заданном `PORTALIS_RAW_TRACE=<base>` записываются `<base>.<pid>` (исходные байты)
-и `<base>.<pid>.chunks` (длина каждого read chunk). Оба файла создаются/обрезаются
-с режимом `0600`, в том числе если файл существовал ранее. Trace может содержать
-весь вывод дочернего процесса, включая отображённые секреты, и растёт без лимита
-до завершения PTY; включайте его только для диагностики и удаляйте после анализа.
-Ошибки записи trace игнорируются, чтобы не останавливать чтение PTY; при ошибке
-хранилища trace может быть неполным.
+и `<base>.<pid>.chunks` (длина каждого read chunk). Файлы создаются с `0600`; существующий
+base path не перезаписывается. Каждая дорожка ограничена `PORTALIS_RAW_TRACE_MAX_BYTES`
+(по умолчанию 16 MiB) и `PORTALIS_RAW_TRACE_MAX_FILES` (по умолчанию 3); значения
+ограничены сверху 1 GiB и 16 файлами. При достижении квоты выполняется ограниченная
+ротация. Ошибки открытия, записи и ротации выдаются как `PtyWarningMsg` и передаются
+через `SetOnError`; запись trace не останавливает PTY output. Trace может содержать
+секреты и включается только для диагностики.
 
 ### Граница read chunk
 
@@ -141,11 +152,11 @@ Read loop читает PTY буфером 4096 байт и сохраняет э
 - Ошибки при изменении размера возвращаются через `Resize`
 - Ошибки при закрытии возвращаются через `Close`
 - EOF и Linux `EIO` от PTY master при завершении slave считаются нормальным завершением; process exit status возвращается в `PtyExitMsg`
-- Другие ошибки отправляются через канал `Errors` и возвращаются через `Listen`
+- Ошибки read loop возвращаются через `Listen`; trace I/O failures доставляются отдельными `PtyWarningMsg` и не завершают процесс
 
 ## Совместимость `PtyExitMsg`
 
-`PtyExitMsg` сохраняет прежние поля `SessionID`, `Generation` и `Err`, но добавляет `ProcessExited`, `ExitCode` и `Signal` для отдельного отчёта о завершении процесса. Именованные литералы совместимы; добавление полей ломает позиционные literals во внешнем коде. До стабильного semver-релиза изменение нужно включить только в подходящий major version либо заменить новым типом сообщения.
+`PtyExitMsg` содержит `SessionID`, `Generation`, `Err`, `ProcessExited`, `ExitCode` и `Signal`. Именованные literals предпочтительны; позиционные литералы внешнего кода ломаются при расширении структуры.
 
 ## Взаимодействие с Bubble Tea
 
@@ -156,7 +167,7 @@ Read loop читает PTY буфером 4096 байт и сохраняет э
 
 ## Безопасность
 
-- Ошибки запуска, записи, resize, close и read-loop передаются вызывающему коду или через `Errors`/`Listen`; ошибки диагностической записи raw trace намеренно игнорируются.
+- Ошибки запуска, записи, resize, close и read-loop передаются вызывающему коду или через `Listen`; trace failures доступны через warning path и не прерывают PTY.
 - Проверка на закрытый PTY перед операциями
 - Процесс убивается при закрытии PTY
 - Используется `pty.Start` для безопасного запуска в PTY
@@ -194,7 +205,7 @@ func RunCommand(command string, args []string) (string, error) {
 ## Примечания
 
 - PTY использует библиотеку `github.com/creack/pty` для создания псевдотерминала
-- Поддерживается терминал `xterm-256color`
+- Child processes получают `TERM=ansi` по умолчанию; caller может явно переопределить его, принимая ответственность за terminfo compatibility.
 - Вывод обрабатывается через `bufio.Reader` для корректного разбора строк
 - Escape-последовательности терминала обрабатываются для поддержки ресайза окна
 
@@ -204,6 +215,7 @@ func RunCommand(command string, args []string) (string, error) {
 Все источники ввода (клавиатура, мышь, DSR/DA replies, focus, paste и `SendBytes`)
 передают данные в одну ограниченную FIFO-очередь. Один writer worker выполняет
 системные записи последовательно; отдельная goroutine на каждый write не создаётся.
-Очередь ограничивает число и суммарный объём ожидающих payload. `Close` отменяет
-enqueue, закрывает PTY fd и завершает worker; операция идемпотентна через
-`sync.Once`, а generation mismatch отбрасывает устаревшие записи.
+Bulk очередь ограничивает 64 запроса и 100 MiB; интерактивный ввод имеет отдельный
+64 KiB reserve и не ждёт writer I/O или заполненного queue slot из UI update.
+`Close` отменяет enqueue, закрывает PTY fd, завершает worker и ждёт reader loop; операция
+идемпотентна через `sync.Once`, а generation mismatch отбрасывает устаревшие записи.

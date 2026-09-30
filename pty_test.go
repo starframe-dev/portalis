@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,22 +26,218 @@ func (r *traceRecorder) Close() error {
 	return nil
 }
 
-func TestOpenPrivateRawTraceRestrictsExistingFile(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "trace.bin")
-	if err := os.WriteFile(path, []byte("old trace"), 0o644); err != nil {
-		t.Fatal(err)
+type failingTraceWriter struct {
+	closed bool
+}
+
+type partialWriteRecorder struct {
+	bytes.Buffer
+	max int
+}
+
+func (w *partialWriteRecorder) Write(data []byte) (int, error) {
+	if len(data) > w.max {
+		data = data[:w.max]
 	}
+	return w.Buffer.Write(data)
+}
+
+type noProgressWriter struct{}
+
+func (noProgressWriter) Write([]byte) (int, error) { return 0, nil }
+
+func (w *failingTraceWriter) Write([]byte) (int, error) {
+	return 0, errors.New("trace storage unavailable")
+}
+
+func (w *failingTraceWriter) Close() error {
+	w.closed = true
+	return nil
+}
+
+func TestOpenPrivateRawTraceRestrictsNewFilesAndRejectsCollision(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "trace.bin")
 	trace, err := openPrivateRawTrace(path)
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer trace.Close()
 	info, err := trace.Stat()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("trace mode = %04o, want 0600", got)
+	}
+	if err := trace.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	if _, err := openPrivateRawTrace(path); !errors.Is(err, os.ErrExist) {
+		t.Fatalf("existing trace path error = %v, want os.ErrExist", err)
+	}
+}
+
+func TestSpawnUsesBoundedRawTraceConfiguration(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "pty-trace")
+	t.Setenv("PORTALIS_RAW_TRACE", base)
+	t.Setenv("PORTALIS_RAW_TRACE_MAX_BYTES", "4")
+	t.Setenv("PORTALIS_RAW_TRACE_MAX_FILES", "2")
+	p, err := Spawn("/bin/sh", []string{"-c", "printf 12345678"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	for {
+		msg := p.Listen("trace-test")()
+		switch value := msg.(type) {
+		case PtyOutputMsg:
+		case PtyWarningMsg:
+			t.Fatalf("unexpected trace warning: %v", value.Err)
+		case PtyExitMsg:
+			goto exited
+		default:
+			t.Fatalf("unexpected PTY message %T", msg)
+		}
+	}
+
+exited:
+	tracePath := fmt.Sprintf("%s.%d", base, p.State().PID)
+	first, err := os.ReadFile(tracePath + ".1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	last, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(append(first, last...)); got != "12345678" {
+		t.Fatalf("rotated PTY trace = %q, want 12345678", got)
+	}
+	for _, path := range []string{tracePath, tracePath + ".1", tracePath + ".chunks"} {
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if info.Mode().Perm() != 0o600 {
+			t.Errorf("%s mode = %04o, want 0600", filepath.Base(path), info.Mode().Perm())
+		}
+		if info.Size() > 4 {
+			t.Errorf("%s size = %d, exceeds configured limit", filepath.Base(path), info.Size())
+		}
+	}
+}
+
+func TestRotatingTraceCapsBytesFilesAndPermissions(t *testing.T) {
+	base := filepath.Join(t.TempDir(), "raw")
+	trace, err := openRotatingTrace(base, rawTraceConfig{maxBytes: 5, maxFiles: 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trace.Write([]byte("abcde")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trace.Write([]byte("fg")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := trace.Write([]byte("hijklmnop")); err != nil {
+		t.Fatal(err)
+	}
+	if err := trace.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	wantContents := map[string]string{
+		base:        "p",
+		base + ".1": "klmno",
+		base + ".2": "fghij",
+	}
+	var totalBytes int64
+	for path, want := range wantContents {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(data) != want {
+			t.Errorf("%s = %q, want %q", filepath.Base(path), data, want)
+		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if mode := info.Mode().Perm(); mode != 0o600 {
+			t.Errorf("%s permissions = %04o, want 0600", filepath.Base(path), mode)
+		}
+		if info.Size() > 5 {
+			t.Errorf("%s size = %d, exceeds 5-byte limit", filepath.Base(path), info.Size())
+		}
+		totalBytes += info.Size()
+	}
+	if totalBytes > 15 {
+		t.Fatalf("retained trace bytes = %d, exceeds configured cap", totalBytes)
+	}
+}
+
+func TestRawTraceConfigRejectsUnboundedEnvironmentValues(t *testing.T) {
+	t.Setenv("PORTALIS_RAW_TRACE_MAX_BYTES", "0")
+	t.Setenv("PORTALIS_RAW_TRACE_MAX_FILES", "999999")
+	config, warnings := rawTraceConfigFromEnv()
+	if config.maxBytes != defaultRawTraceMaxBytes || config.maxFiles != defaultRawTraceMaxFiles || len(warnings) != 2 {
+		t.Fatalf("trace config = %+v, warnings = %v", config, warnings)
+	}
+}
+
+func TestWriteAllHandlesPartialAndZeroWrites(t *testing.T) {
+	partial := &partialWriteRecorder{max: 2}
+	if err := writeAll(partial, []byte("partial writes")); err != nil {
+		t.Fatal(err)
+	}
+	if got := partial.String(); got != "partial writes" {
+		t.Fatalf("partial writer received %q", got)
+	}
+	if err := writeAll(noProgressWriter{}, []byte("x")); !errors.Is(err, io.ErrShortWrite) {
+		t.Fatalf("zero-progress writer error = %v, want io.ErrShortWrite", err)
+	}
+}
+
+func TestTraceWriteFailureWarnsWithoutDroppingPTYOutput(t *testing.T) {
+	trace := &failingTraceWriter{}
+	p := &Pty{
+		reader:   bufio.NewReader(bytes.NewBufferString("output")),
+		rawTrace: trace,
+		output:   make(chan []byte, 1),
+		errors:   make(chan error, 1),
+		warnings: make(chan error, 4),
+		readDone: make(chan struct{}),
+		done:     make(chan struct{}),
+	}
+	p.readLoop()
+	if !trace.closed {
+		t.Fatal("failed trace writer was not closed")
+	}
+
+	sawOutput := false
+	sawWarning := false
+	for range 2 {
+		msg := p.Listen("session")()
+		switch value := msg.(type) {
+		case PtyOutputMsg:
+			if string(value.Data) != "output" {
+				t.Fatalf("PTY output = %q, want output", value.Data)
+			}
+			sawOutput = true
+		case PtyWarningMsg:
+			if value.Err == nil || !strings.Contains(value.Err.Error(), "trace storage unavailable") {
+				t.Fatalf("trace warning = %v", value.Err)
+			}
+			sawWarning = true
+		default:
+			t.Fatalf("unexpected PTY message %T", msg)
+		}
+	}
+	if !sawOutput || !sawWarning {
+		t.Fatalf("observed output=%v warning=%v, want both", sawOutput, sawWarning)
 	}
 }
 
@@ -52,8 +249,8 @@ func TestPtyReadLoopCopiesRawBytesToTrace(t *testing.T) {
 		reader:         bufio.NewReader(bytes.NewBufferString(raw)),
 		rawTrace:       recorder,
 		rawTraceChunks: chunks,
-		Output:         make(chan []byte, 1),
-		Errors:         make(chan error, 1),
+		output:         make(chan []byte, 1),
+		errors:         make(chan error, 1),
 		done:           make(chan struct{}),
 	}
 
@@ -71,18 +268,18 @@ func TestPtyReadLoopCopiesRawBytesToTrace(t *testing.T) {
 	if !chunks.closed {
 		t.Fatal("chunk trace was not closed after read loop exit")
 	}
-	if got := string(<-p.Output); got != raw {
+	if got := string(<-p.output); got != raw {
 		t.Fatalf("PTY output = %q, want %q", got, raw)
 	}
 }
 
 func TestPtyListenPreservesReadBoundaries(t *testing.T) {
 	p := &Pty{
-		Output: make(chan []byte, 2),
-		Errors: make(chan error, 1),
+		output: make(chan []byte, 2),
+		errors: make(chan error, 1),
 	}
-	p.Output <- []byte("tmux")
-	p.Output <- []byte("frame")
+	p.output <- []byte("tmux")
+	p.output <- []byte("frame")
 
 	for _, expected := range []string{"tmux", "frame"} {
 		msg := p.Listen("session")()
@@ -215,10 +412,10 @@ func TestPtyResizeAcceptsMaximumSingleDimension(t *testing.T) {
 
 func TestPtyListenHandlesClosedErrorChannel(t *testing.T) {
 	p := &Pty{
-		Output: make(chan []byte),
-		Errors: make(chan error),
+		output: make(chan []byte),
+		errors: make(chan error),
 	}
-	close(p.Errors)
+	close(p.errors)
 	msg := p.Listen("session")()
 	exit, ok := msg.(PtyExitMsg)
 	if !ok {
@@ -231,11 +428,11 @@ func TestPtyListenHandlesClosedErrorChannel(t *testing.T) {
 
 func TestPtyListenDrainsBufferedOutputBeforeExit(t *testing.T) {
 	p := &Pty{
-		Output:   make(chan []byte, 2),
-		Errors:   make(chan error, 1),
+		output:   make(chan []byte, 2),
+		errors:   make(chan error, 1),
 		readDone: make(chan struct{}),
 	}
-	p.Output <- []byte("final")
+	p.output <- []byte("final")
 	p.terminalErr = errors.New("terminal closed")
 	close(p.readDone)
 
@@ -336,6 +533,96 @@ func TestPTYWritesAreSerialized(t *testing.T) {
 	}
 }
 
+func TestPTYConcurrentWritesRemainAtomic(t *testing.T) {
+	const writerCount = 100
+	p, err := Spawn("/bin/sh", []string{"-c", "stty -echo -icanon min 1 time 0; printf READY; cat"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	readOutput := func(timeout time.Duration) ([]byte, error) {
+		message := make(chan any, 1)
+		go func() { message <- p.Listen("concurrent-write")() }()
+		select {
+		case msg := <-message:
+			switch value := msg.(type) {
+			case PtyOutputMsg:
+				return value.Data, nil
+			case PtyExitMsg:
+				return nil, fmt.Errorf("PTY exited: %w", value.Err)
+			default:
+				return nil, fmt.Errorf("unexpected PTY message %T", msg)
+			}
+		case <-time.After(timeout):
+			return nil, errors.New("timed out waiting for PTY output")
+		}
+	}
+	ready, err := readOutput(time.Second)
+	if err != nil || string(ready) != "READY" {
+		t.Fatalf("PTY readiness = %q, %v", ready, err)
+	}
+
+	start := make(chan struct{})
+	writeErrs := make(chan error, writerCount)
+	payloads := make([][]byte, writerCount)
+	var expectedBytes int
+	for i := range writerCount {
+		payload := []byte(fmt.Sprintf("<%03d:%016x>", i, i))
+		payloads[i] = payload
+		expectedBytes += len(payload)
+		go func(data []byte) {
+			<-start
+			writeErrs <- p.Write(data)
+		}(payload)
+	}
+	close(start)
+	for range writerCount {
+		if err := <-writeErrs; err != nil {
+			t.Fatalf("concurrent PTY write: %v", err)
+		}
+	}
+
+	var got []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for len(got) < expectedBytes {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			t.Fatalf("received %d/%d echoed bytes", len(got), expectedBytes)
+		}
+		chunk, err := readOutput(remaining)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, chunk...)
+	}
+	if len(got) != expectedBytes {
+		t.Fatalf("echoed bytes = %d, want %d", len(got), expectedBytes)
+	}
+
+	remaining := make(map[string]int, writerCount)
+	for _, payload := range payloads {
+		remaining[string(payload)]++
+	}
+	for offset := 0; offset < len(got); {
+		length := len(payloads[0])
+		if offset+length > len(got) {
+			t.Fatalf("truncated write payload at offset %d", offset)
+		}
+		key := string(got[offset : offset+length])
+		if remaining[key] == 0 {
+			t.Fatalf("interleaved or unknown payload at offset %d: %q", offset, key)
+		}
+		remaining[key]--
+		offset += length
+	}
+	for payload, count := range remaining {
+		if count != 0 {
+			t.Fatalf("payload %q arrived %d extra times", payload, count)
+		}
+	}
+}
+
 func TestPTYWriterDropsStaleGeneration(t *testing.T) {
 	p, err := Spawn("/bin/sh", []string{"-c", "stty -echo; cat"})
 	if err != nil {
@@ -344,7 +631,7 @@ func TestPTYWriterDropsStaleGeneration(t *testing.T) {
 	defer p.Close()
 	p.setWriteGeneration(8)
 
-	if err := p.WriteForGeneration(7, []byte("stale")); !errors.Is(err, errStalePtyWrite) {
+	if err := p.writeForGeneration(7, []byte("stale")); !errors.Is(err, errStalePtyWrite) {
 		t.Fatalf("stale-generation write error = %v, want %v", err, errStalePtyWrite)
 	}
 }
@@ -373,6 +660,80 @@ func TestPTYWriterCloseUnblocksPendingWrite(t *testing.T) {
 	case <-writeDone:
 	case <-time.After(time.Second):
 		t.Fatal("pending write did not unblock after Close")
+	}
+	select {
+	case <-p.readDone:
+	default:
+		t.Fatal("Close returned before the PTY reader goroutine exited")
+	}
+}
+
+func TestPTYWriterCloseUnblocksSaturatedQueue(t *testing.T) {
+	p, err := Spawn("sleep", []string{"5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer p.Close()
+
+	active, err := p.enqueueWrite(0, bytes.Repeat([]byte{'x'}, 8<<20))
+	if err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(time.Second)
+	for len(p.writeQueue) != 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("writer did not take the blocking payload")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case err := <-active:
+		t.Fatalf("blocking payload completed unexpectedly: %v", err)
+	default:
+	}
+
+	queued := make([]<-chan error, 0, ptyWriteQueueCapacity)
+	for i := 0; i < ptyWriteQueueCapacity; i++ {
+		result, err := p.enqueueWrite(0, []byte("q"))
+		if err != nil {
+			t.Fatalf("enqueue saturated request %d: %v", i, err)
+		}
+		queued = append(queued, result)
+	}
+	if len(p.writeQueue) != ptyWriteQueueCapacity {
+		t.Fatalf("queued requests = %d, want %d", len(p.writeQueue), ptyWriteQueueCapacity)
+	}
+
+	extraDone := make(chan error, 1)
+	go func() {
+		_, err := p.enqueueWrite(0, []byte("blocked"))
+		extraDone <- err
+	}()
+	time.Sleep(10 * time.Millisecond)
+	closeDone := make(chan error, 1)
+	go func() { closeDone <- p.Close() }()
+	select {
+	case err := <-extraDone:
+		if !errors.Is(err, errPtyClosed) {
+			t.Fatalf("blocked enqueue error = %v, want closed", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Close did not unblock the saturated-queue producer")
+	}
+	select {
+	case err := <-closeDone:
+		if err != nil {
+			t.Fatalf("Close: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Close deadlocked on a saturated write queue")
+	}
+	for _, result := range append([]<-chan error{active}, queued...) {
+		select {
+		case <-result:
+		case <-time.After(time.Second):
+			t.Fatal("queued write result was not completed during Close")
+		}
 	}
 }
 
@@ -445,7 +806,7 @@ func TestSpawnTERMDefaultsAndAllowsOverride(t *testing.T) {
 		env  []string
 		want string
 	}{
-		{name: "default", want: "xterm-256color"},
+		{name: "default", want: "ansi"},
 		{name: "explicit-override", env: []string{"TERM=screen-256color"}, want: "screen-256color"},
 	} {
 		t.Run(test.name, func(t *testing.T) {

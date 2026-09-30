@@ -173,18 +173,24 @@ type cursorBlinkMsg = CursorBlinkMsg</code></pre>
         <div class="signature">
 <pre><code class="language-go">type PtyReadyMsg struct {
 	SessionID      string
+	Generation     uint64
 	AlreadyRunning bool
+	ResizeErr      error
 }</code></pre>
 </div>
 
-        <p><strong>PtyReadyMsg</strong> is sent when the PTY is ready for listening.</p>
+        <p><strong>PtyReadyMsg</strong> is sent when the PTY is ready for listening. <code>ResizeErr</code> carries a non-fatal initial resize error; the PTY remains attached at its last successfully applied size.</p>
 
         <h3>PtyExitMsg</h3>
 
         <div class="signature">
 <pre><code class="language-go">type PtyExitMsg struct {
-	SessionID string
-	Err       error
+	SessionID     string
+	Generation    uint64
+	ProcessExited bool
+	ExitCode      int
+	Signal        os.Signal
+	Err           error
 }</code></pre>
 </div>
 

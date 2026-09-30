@@ -1,6 +1,7 @@
 package portalis
 
 import (
+	"bytes"
 	"errors"
 	"os"
 	"strings"
@@ -38,15 +39,19 @@ func TestStartResizeUsesLatestDimensions(t *testing.T) {
 	}()
 	<-firstResizeStarted
 
-	// This is the locked state update used by ResizeMsg. Keep the first PTY
+	// This is the locked request update used by ResizeMsg. Keep the first PTY
 	// ioctl blocked so Start must detect the newer generation before returning.
 	emulator.mu.Lock()
-	if err := emulator.updateTerminalSizeLocked(40, 120); err != nil {
+	if err := emulator.requestTerminalSizeLocked(40, 120); err != nil {
 		emulator.mu.Unlock()
 		close(releaseFirstResize)
 		t.Fatal(err)
 	}
 	emulator.mu.Unlock()
+	if emulator.screen.rows != defaultTerminalRows || emulator.screen.cols != defaultTerminalCols {
+		close(releaseFirstResize)
+		t.Fatalf("Screen changed before TIOCSWINSZ succeeded: %dx%d", emulator.screen.rows, emulator.screen.cols)
+	}
 	close(releaseFirstResize)
 
 	if err := <-startResize; err != nil {
@@ -55,11 +60,108 @@ func TestStartResizeUsesLatestDimensions(t *testing.T) {
 	if pty.lastRows != 40 || pty.lastCols != 120 {
 		t.Fatalf("PTY size = %dx%d, want latest 40x120", pty.lastRows, pty.lastCols)
 	}
-	if emulator.screen.Rows != 40 || emulator.screen.Cols != 120 {
-		t.Fatalf("Screen size = %dx%d, want 40x120", emulator.screen.Rows, emulator.screen.Cols)
+	if emulator.screen.rows != 40 || emulator.screen.cols != 120 {
+		t.Fatalf("Screen size = %dx%d, want 40x120", emulator.screen.rows, emulator.screen.cols)
+	}
+	if emulator.height != 40 || emulator.width != 120 {
+		t.Fatalf("applied emulator size = %dx%d, want 40x120", emulator.height, emulator.width)
 	}
 	if len(applied) != 2 || applied[0].Rows != 24 || applied[0].Cols != 80 || applied[1].Rows != 40 || applied[1].Cols != 120 {
 		t.Fatalf("applied PTY sizes = %#v, want [24x80 40x120]", applied)
+	}
+}
+
+func TestResizeRetriesLatestAfterStaleFailure(t *testing.T) {
+	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
+	emulator.screen = NewScreen(defaultTerminalRows, defaultTerminalCols)
+	emulator.listenerGeneration = 1
+	if err := emulator.requestTerminalSizeLocked(25, defaultTerminalCols); err != nil {
+		t.Fatal(err)
+	}
+	firstResizeStarted := make(chan struct{})
+	releaseFirstResize := make(chan struct{})
+	var calls int
+	pty := &Pty{ptmx: &os.File{}, lastRows: defaultTerminalRows, lastCols: defaultTerminalCols}
+	pty.setSize = func(_ *os.File, _ *creackpty.Winsize) error {
+		calls++
+		if calls == 1 {
+			close(firstResizeStarted)
+			<-releaseFirstResize
+			return errors.New("stale ioctl failure")
+		}
+		return nil
+	}
+	emulator.pty = pty
+	generation := emulator.listenerGeneration
+	resizeDone := make(chan error, 1)
+	go func() {
+		_, err := emulator.resizeAttachedPTY(pty, generation)
+		resizeDone <- err
+	}()
+	<-firstResizeStarted
+
+	emulator.mu.Lock()
+	if err := emulator.requestTerminalSizeLocked(40, 120); err != nil {
+		emulator.mu.Unlock()
+		close(releaseFirstResize)
+		t.Fatal(err)
+	}
+	emulator.mu.Unlock()
+	close(releaseFirstResize)
+
+	if err := <-resizeDone; err != nil {
+		t.Fatalf("resize returned stale error: %v", err)
+	}
+	if calls != 2 || pty.lastRows != 40 || pty.lastCols != 120 {
+		t.Fatalf("resize calls=%d PTY=%dx%d, want 2 calls and latest 40x120", calls, pty.lastRows, pty.lastCols)
+	}
+	if emulator.screen.rows != 40 || emulator.screen.cols != 120 {
+		t.Fatalf("Screen size = %dx%d, want latest 40x120", emulator.screen.rows, emulator.screen.cols)
+	}
+}
+
+func TestPanelResizeFailureKeepsPTYAndAppliedSize(t *testing.T) {
+	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
+	screen := NewScreen(2, 3)
+	emulator.screen = screen
+	emulator.height, emulator.width = 2, 3
+	emulator.requestedHeight, emulator.requestedWidth = 2, 3
+	emulator.listenerGeneration = 1
+	ioctlErr := errors.New("TIOCSWINSZ failed")
+	pty := &Pty{
+		ptmx:     &os.File{},
+		lastRows: 2,
+		lastCols: 3,
+		setSize: func(_ *os.File, _ *creackpty.Winsize) error {
+			return ioctlErr
+		},
+	}
+	emulator.pty = pty
+
+	cmd := emulator.Update(ResizeMsg{Width: 4, Height: 3})
+	if cmd == nil {
+		t.Fatal("resize failure did not produce a nonfatal warning")
+	}
+	msg, ok := cmd().(PtyWarningMsg)
+	if !ok || !errors.Is(msg.Err, ioctlErr) {
+		t.Fatalf("resize error message = %#v, want PtyWarningMsg wrapping ioctl error", msg)
+	}
+	var reported error
+	emulator.SetOnError(func(err error) { reported = err })
+	if listener := emulator.Update(msg); listener == nil || !errors.Is(reported, ioctlErr) {
+		t.Fatalf("resize error was not reported non-fatally: listener=%v reported=%v", listener != nil, reported)
+	}
+	if emulator.pty != pty || emulator.stopped {
+		t.Fatal("resize error detached or stopped the PTY")
+	}
+	if screen.rows != 2 || screen.cols != 3 || emulator.height != 2 || emulator.width != 3 {
+		t.Fatalf("failed resize changed applied size: Screen=%dx%d emulator=%dx%d", screen.rows, screen.cols, emulator.height, emulator.width)
+	}
+	if emulator.requestedHeight != 3 || emulator.requestedWidth != 4 {
+		t.Fatalf("requested size=%dx%d, want 3x4", emulator.requestedHeight, emulator.requestedWidth)
+	}
+	if pty.lastRows != 2 || pty.lastCols != 3 {
+		t.Fatalf("PTY size changed after failed ioctl to %dx%d", pty.lastRows, pty.lastCols)
 	}
 }
 
@@ -84,6 +186,41 @@ func TestInitialPTYHasSaneWinsize(t *testing.T) {
 		default:
 			t.Fatalf("unexpected PTY message %T", msg)
 		}
+	}
+}
+
+func TestResizeWithoutPTYAppliesScreenImmediately(t *testing.T) {
+	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
+	emulator.screen = NewScreen(2, 3)
+	emulator.height, emulator.width = 2, 3
+	emulator.requestedHeight, emulator.requestedWidth = 2, 3
+
+	if cmd := emulator.Update(ResizeMsg{Width: 4, Height: 3}); cmd != nil {
+		t.Fatalf("resize without PTY returned command %T", cmd)
+	}
+	if emulator.screen.rows != 3 || emulator.screen.cols != 4 || emulator.height != 3 || emulator.width != 4 {
+		t.Fatalf("screen/applied size = Screen %dx%d, size %dx%d; want 3x4", emulator.screen.rows, emulator.screen.cols, emulator.height, emulator.width)
+	}
+	if emulator.requestedHeight != 3 || emulator.requestedWidth != 4 {
+		t.Fatalf("requested size = %dx%d, want 3x4", emulator.requestedHeight, emulator.requestedWidth)
+	}
+}
+
+func TestPtyReadyReportsResizeErrorAndStartsListener(t *testing.T) {
+	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
+	emulator.listenerGeneration = 1
+	emulator.pty = &Pty{
+		output:   make(chan []byte),
+		errors:   make(chan error),
+		warnings: make(chan error),
+	}
+	resizeErr := errors.New("resize warning")
+	var reported error
+	emulator.SetOnError(func(err error) { reported = err })
+
+	cmd := emulator.Update(PtyReadyMsg{SessionID: "session", Generation: 1, ResizeErr: resizeErr})
+	if cmd == nil || reported != resizeErr {
+		t.Fatalf("ready resize error handling: listener=%v reported=%v", cmd != nil, reported)
 	}
 }
 
@@ -124,15 +261,15 @@ func TestPanelResizeRejectsInvalidDimensionsBeforeMutation(t *testing.T) {
 		if cmd := emulator.Update(size); cmd != nil {
 			t.Fatalf("invalid resize returned command %T", cmd)
 		}
-		if screen.Rows != 2 || screen.Cols != 3 {
-			t.Fatalf("invalid resize changed screen to %dx%d", screen.Rows, screen.Cols)
+		if screen.rows != 2 || screen.cols != 3 {
+			t.Fatalf("invalid resize changed screen to %dx%d", screen.rows, screen.cols)
 		}
 	}
 	if resizeCalls != 0 {
 		t.Fatalf("invalid resize reached PTY %d times, want 0", resizeCalls)
 	}
-	if emulator.width != defaultTerminalCols || emulator.height != defaultTerminalRows {
-		t.Fatalf("invalid resize changed requested size to %dx%d", emulator.height, emulator.width)
+	if emulator.requestedWidth != defaultTerminalCols || emulator.requestedHeight != defaultTerminalRows {
+		t.Fatalf("invalid resize changed requested size to %dx%d", emulator.requestedHeight, emulator.requestedWidth)
 	}
 }
 
@@ -163,8 +300,8 @@ func TestListenAllowsOnlyOnePendingReader(t *testing.T) {
 	output := make(chan []byte, 2)
 	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
 	emulator.pty = &Pty{
-		Output: output,
-		Errors: make(chan error, 1),
+		output: output,
+		errors: make(chan error, 1),
 	}
 
 	first := emulator.Listen()
@@ -202,8 +339,8 @@ func TestAlreadyRunningReadyDoesNotStartListener(t *testing.T) {
 	output := make(chan []byte, 1)
 	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
 	emulator.pty = &Pty{
-		Output: output,
-		Errors: make(chan error, 1),
+		output: output,
+		errors: make(chan error, 1),
 	}
 
 	first := emulator.Listen()
@@ -220,6 +357,66 @@ func TestAlreadyRunningReadyDoesNotStartListener(t *testing.T) {
 	}
 }
 
+func TestInteractiveKeyEnqueueDoesNotWaitForBlockedPTYWrite(t *testing.T) {
+	pty, err := Spawn("/bin/sh", []string{"-c", "sleep 5"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer pty.Close()
+
+	writeDone := make(chan error, 1)
+	go func() {
+		writeDone <- pty.Write(bytes.Repeat([]byte{'x'}, 16<<20))
+	}()
+	deadline := time.Now().Add(time.Second)
+	for {
+		pty.writeBudget.mu.Lock()
+		queuedBytes := pty.writeBudget.used
+		pty.writeBudget.mu.Unlock()
+		if queuedBytes > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("large PTY write was not admitted")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(25 * time.Millisecond)
+	select {
+	case err := <-writeDone:
+		t.Fatalf("large PTY write unexpectedly completed before exercising backpressure: %v", err)
+	default:
+	}
+
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.pty = pty
+	em.listenerGeneration = 0
+	em.screen = NewScreen(24, 80)
+	em.mu.Unlock()
+
+	started := time.Now()
+	cmd := em.handleKey(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'k'}})
+	if elapsed := time.Since(started); elapsed > 100*time.Millisecond {
+		t.Fatalf("key update blocked for %s while PTY writer was backpressured", elapsed)
+	}
+	if cmd == nil {
+		t.Fatal("interactive write did not return a completion command")
+	}
+
+	if err := pty.Close(); err != nil {
+		t.Fatalf("close blocked PTY: %v", err)
+	}
+	select {
+	case <-writeDone:
+	case <-time.After(time.Second):
+		t.Fatal("blocked PTY write did not unblock during close")
+	}
+	if msg := cmd(); msg != nil {
+		t.Fatalf("completion command after close = %#v, want nil", msg)
+	}
+}
+
 func TestPtyOutputOSC7DoesNotDeadlock(t *testing.T) {
 	emulator := NewEmulator("session", "Session", "/bin/sh", nil)
 	emulator.mu.Lock()
@@ -229,11 +426,11 @@ func TestPtyOutputOSC7DoesNotDeadlock(t *testing.T) {
 	emulator.mu.Unlock()
 
 	var callbackCalls atomic.Int32
-	emulator.OnCWDChange = func(path string) {
-		if got := emulator.CWD(); got == path {
+	emulator.SetOnCWDChange(func(cwd WorkingDirectory) {
+		if got, ok := emulator.CurrentWorkingDirectory(); ok && got == cwd {
 			callbackCalls.Add(1)
 		}
-	}
+	})
 
 	finished := make(chan bool, 1)
 	go func() {
@@ -320,6 +517,73 @@ func TestSetCommandHistoryKeepsNewestLimit(t *testing.T) {
 	}
 }
 
+func TestEmulatorSurfacesTraceWarningAndContinuesListening(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.resetTerminalLocked()
+	generation := em.listenerGeneration
+	em.pty = &Pty{output: make(chan []byte), errors: make(chan error), warnings: make(chan error)}
+	em.mu.Unlock()
+
+	var warnings atomic.Int32
+	em.SetOnError(func(error) { warnings.Add(1) })
+	cmd := em.Update(PtyWarningMsg{
+		SessionID:  "session",
+		Generation: generation,
+		Err:        errors.New("trace rotation failed"),
+	})
+	if warnings.Load() != 1 {
+		t.Fatalf("OnError calls = %d, want one trace warning", warnings.Load())
+	}
+	if cmd == nil {
+		t.Fatal("trace warning stopped the PTY listener chain")
+	}
+}
+
+func TestEmulatorPreservesStructuredOSCMetadata(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	em.mu.Lock()
+	em.resetTerminalLocked()
+	generation := em.listenerGeneration
+	em.pty = &Pty{}
+	em.mu.Unlock()
+
+	cwdCalls := make(chan WorkingDirectory, 1)
+	titleCalls := make(chan string, 1)
+	em.SetOnCWDChange(func(cwd WorkingDirectory) {
+		if current, ok := em.CurrentWorkingDirectory(); ok && current == cwd {
+			cwdCalls <- cwd
+		}
+	})
+	em.SetOnTitleChange(func(title string) {
+		if em.Title() == title {
+			titleCalls <- title
+		}
+	})
+	em.Update(PtyOutputMsg{
+		SessionID:  "session",
+		Generation: generation,
+		Data:       []byte("\x1b]7;file://build-host.example/work/project\x07\x1b]2;Build\x07"),
+	})
+
+	select {
+	case cwd := <-cwdCalls:
+		if cwd.Host != "build-host.example" || cwd.Local || cwd.Path != "/work/project" {
+			t.Fatalf("OSC 7 callback = %+v", cwd)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OSC 7 callback did not run")
+	}
+	select {
+	case title := <-titleCalls:
+		if title != "Build" {
+			t.Fatalf("title callback = %q, want Build", title)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OSC title callback did not run")
+	}
+}
+
 func TestStalePtyOutputGenerationIsIgnored(t *testing.T) {
 	em := NewEmulator("session", "Session", "/bin/sh", nil)
 	em.mu.Lock()
@@ -349,10 +613,10 @@ func TestCommandHistoryCallbackMayReenterEmulator(t *testing.T) {
 	defer em.Close()
 
 	done := make(chan struct{})
-	em.OnCommandHistoryChanged = func(_ []string) {
+	em.SetOnCommandHistoryChanged(func(_ []string) {
 		_ = em.CWD()
 		close(done)
-	}
+	})
 
 	em.handleKey(tea.KeyMsg{Type: tea.KeyEnter})
 	select {
@@ -386,7 +650,8 @@ func TestResetTerminalClearsStaleCWD(t *testing.T) {
 	em := NewEmulator("session", "Session", "/bin/sh", nil)
 	em.SetInitialCWD("/initial")
 	em.mu.Lock()
-	em.cwd = "/old"
+	em.cwd = WorkingDirectory{Path: "/old", Local: true}
+	em.cwdSet = true
 	em.resetTerminalLocked()
 	em.mu.Unlock()
 	if got := em.CWD(); got != "/initial" {
@@ -490,15 +755,55 @@ func TestFocusReportingWritesDECSequence(t *testing.T) {
 func TestErrorMessagesReachOnError(t *testing.T) {
 	em := NewEmulator("session", "Session", "/bin/sh", nil)
 	var calls atomic.Int32
-	em.OnError = func(err error) {
+	em.SetOnError(func(err error) {
 		if err != nil {
 			calls.Add(1)
 		}
-	}
+	})
 	em.Update(ClipboardErrorMsg{Err: errors.New("clipboard")})
 	em.Update(PtyErrorMsg{Err: errors.New("pty")})
 	if got := calls.Load(); got != 2 {
 		t.Fatalf("OnError calls = %d, want 2", got)
+	}
+}
+
+func TestOnExitCallbackReceivesProcessStatusOutsideLock(t *testing.T) {
+	em := NewEmulator("session", "Session", "/bin/sh", nil)
+	store, err := newClipboardTempStore(DefaultClipboardTempPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := store.directory()
+	t.Cleanup(func() { _ = store.close() })
+	em.mu.Lock()
+	em.resetTerminalLocked()
+	generation := em.listenerGeneration
+	em.pty = &Pty{}
+	em.clipboardTempStore = store
+	em.mu.Unlock()
+
+	called := make(chan PtyExitMsg, 1)
+	em.SetOnExit(func(msg PtyExitMsg) {
+		_ = em.CWD()
+		called <- msg
+	})
+	em.Update(PtyExitMsg{
+		SessionID:     em.SessionID(),
+		Generation:    generation,
+		ProcessExited: true,
+		ExitCode:      17,
+	})
+
+	select {
+	case got := <-called:
+		if got.ExitCode != 17 || !got.ProcessExited {
+			t.Fatalf("OnExit status = %#v, want exited with code 17", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("OnExit callback was not invoked")
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("clipboard directory remains after child exit: %v", err)
 	}
 }
 
@@ -507,7 +812,7 @@ func TestStaleReadyGenerationDoesNotStartListener(t *testing.T) {
 	em.mu.Lock()
 	em.resetTerminalLocked()
 	current := em.listenerGeneration
-	em.pty = &Pty{Output: make(chan []byte), Errors: make(chan error)}
+	em.pty = &Pty{output: make(chan []byte), errors: make(chan error)}
 	em.mu.Unlock()
 
 	if cmd := em.Update(PtyReadyMsg{SessionID: "session", Generation: current - 1}); cmd != nil {
@@ -542,23 +847,35 @@ func TestLocalDragReleaseWinsAfterShiftIsReleased(t *testing.T) {
 	}
 }
 
-func TestCloseRemovesTrackedClipboardTempFiles(t *testing.T) {
-	file, err := os.CreateTemp("", "portalis-cleanup-*")
+func TestCloseRemovesPrivateClipboardDirectory(t *testing.T) {
+	store, err := newClipboardTempStore(DefaultClipboardTempPolicy())
 	if err != nil {
 		t.Fatal(err)
 	}
-	path := file.Name()
-	if err := file.Close(); err != nil {
+	dir := store.directory()
+	path, err := os.CreateTemp(dir, "clipboard-test-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	filePath := path.Name()
+	if _, err := path.Write([]byte("clipboard")); err != nil {
+		t.Fatal(err)
+	}
+	if err := path.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.register(filePath); err != nil {
 		t.Fatal(err)
 	}
 
 	em := NewEmulator("session", "Session", "/bin/sh", nil)
 	em.mu.Lock()
-	em.tempFiles = append(em.tempFiles, path)
+	em.clipboardTempStore = store
 	em.mu.Unlock()
-	em.Close()
-
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatalf("tracked temp file still exists after Close: %v", err)
+	if err := em.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(dir); !os.IsNotExist(err) {
+		t.Fatalf("private clipboard directory remains after Close: %v", err)
 	}
 }

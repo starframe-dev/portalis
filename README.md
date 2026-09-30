@@ -8,19 +8,21 @@ and forwards keyboard, mouse and resize events.
 ## Features
 
 - PTY-backed session via [`creack/pty`](https://github.com/creack/pty)
-- ANSI/VT parser: CSI, OSC, SGR colors (16 / 256 / 24-bit), UTF-8
+- Bounded ANSI/VT subset: CSI, OSC, SGR colors (16 / 256 / 24-bit), UTF-8
+- Child processes default to `TERM=ansi` (8-color terminfo), not xterm-256color; callers can override `TERM`
 - xterm-compatible key encoding (Ctrl/Alt/Shift/F-keys, application cursor mode)
-- DEC modes: `?1` application cursor, `?6` origin, `?7` autowrap, `?25` cursor visibility, `?1000/1002/1003/1006` mouse, `?1004` focus, `?1049` alt screen, `?2004` bracketed paste, `?2026` synchronized output
-- Editing sequences: ICH (`CSI @`), DCH (`CSI P`), ECH (`CSI X`), IL (`CSI L`), DL (`CSI M`), SU (`CSI S`), SD (`CSI T`), VPA (`CSI d`), HPA (`CSI G`)
-- Scroll regions, index/reverse index, DEC Special Graphics charset
-- OSC 7 working-directory tracking with callbacks
+- DEC modes: `?1` application cursor, `?6` origin, `?7` autowrap, `?25` cursor visibility, `?1000/1002/1003/1006` mouse, `?1004` focus, `?1047/1048/1049` alternate buffer/cursor, `?2004` bracketed paste, `?2026` synchronized output
+- Editing sequences: insert mode, tab stops, ICH (`CSI @`), DCH (`CSI P`), ECH (`CSI X`), IL (`CSI L`), DL (`CSI M`), SU (`CSI S`), SD (`CSI T`), VPA (`CSI d`), HPA (`CSI G`)
+- RIS/DECSTR resets, scroll regions, index/reverse index, DEC Special Graphics charset
+- OSC 0/2 title tracking and structured OSC 7 locations (`Host`, `Path`, `Local`)
 - System clipboard selection and explicit paste integration (macOS, Wayland, X11)
 - Synchronized output (`CSI ? 2026 h/l`)
 - Mouse-drag selection, DEC mouse reporting, focus reporting, and host-driven cursor blinking
 - Scrollback capped at 10 000 lines and 1 048 576 cells; alternate screen and bracketed paste
-- Command history capped at 1 000 entries
+- Heuristic command capture from the visible prompt line (not shell history), capped at 1 000 entries
+- Interactive key/mouse writes are admitted without waiting for PTY I/O; a shared FIFO writer preserves payload order
 - Render dirty-cache and ordered 4 KiB PTY reads for responsive streaming
-- Framework-agnostic core: feed events, call `View(w, h)` to render
+- Embeddable Bubble Tea component: the host owns its model, forwards messages and calls `View(w, h)` to render
 
 ## Installation
 
@@ -34,7 +36,9 @@ Requires Go 1.25.8 or later. PTY process support currently targets Unix-like sys
 
 `Emulator` is an embeddable terminal component, **not** a `tea.Model` by
 itself. A host model forwards Bubble Tea messages, sends the allocated content
-size as `ResizeMsg`, and renders with `View(width, height)`:
+size as `ResizeMsg`, and renders with `View(width, height)`. Resize errors are
+reported through `SetOnError` without stopping the PTY; the screen keeps its last
+successfully applied size:
 
 ```go
 package main
@@ -53,7 +57,7 @@ type model struct {
 
 func newModel() *model {
     term := portalis.NewEmulator("session-1", "build", "bash", []string{"-l"})
-    term.OnError = func(err error) { log.Printf("terminal: %v", err) }
+    term.SetOnError(func(err error) { log.Printf("terminal: %v", err) })
     return &model{term: term}
 }
 
@@ -98,14 +102,27 @@ blinking should broadcast `portalis.CursorBlinkMsg{}` from one shared timer.
 ## Resource limits and diagnostics
 
 - A terminal grid is limited to 262 144 cells; scrollback has a separate
-  1 048 576-cell cap, even if its line-count limit is disabled.
-- Clipboard subprocesses time out after 5 seconds. Clipboard text/image data is
-  capped at 100 MiB; decoded PNGs are capped at 25 million pixels.
-- PTY writes are serialized through a bounded queue (64 requests / 100 MiB).
+  1 048 576-cell cap, even if its line-count limit is disabled. Grapheme payloads
+  are capped at 64 bytes per cell (about 96 MiB worst-case across primary,
+  alternate and scrollback buffers, excluding runtime/cell overhead).
+- Clipboard subprocesses time out after 5 seconds. Clipboard text/image bytes
+  are capped at 100 MiB; PNGs are limited to 25 million pixels and 128 MiB of
+  worst-case decoded RGBA64 data. Per-emulator clipboard temp storage defaults
+  to 16 files, 256 MiB total, and a one-hour TTL in a private `0700` directory.
+- Bulk PTY writes are bounded to 100 MiB and 64 queued requests; interactive
+  writes have a separate 64 KiB reserve and fail fast under overload.
 - Setting `PORTALIS_RAW_TRACE=<base>` writes `<base>.<pid>` and a `.chunks`
-  sidecar with mode `0600`. Traces include child output, may contain secrets,
-  and grow without a size limit; enable only for diagnostics and remove them
-  after use.
+  sidecar with mode `0600`. Each trace defaults to 16 MiB per file and 3 retained
+  files; `PORTALIS_RAW_TRACE_MAX_BYTES` and `PORTALIS_RAW_TRACE_MAX_FILES` can
+  tune those bounded limits. Trace warnings go to `SetOnError`. Traces include
+  child output and may contain secrets; enable only for diagnostics.
+
+## API migration
+
+The API was tightened before v1: mutable `Screen` and `Pty` fields are private,
+`Emulator.Pty()` was removed, callbacks use setters, and OSC 7 callbacks now
+receive `WorkingDirectory`. See [MIGRATION.md](MIGRATION.md) for before/after
+examples and the command-history limitation.
 
 ## Architecture
 
@@ -145,15 +162,18 @@ govulncheck ./...
 go test -run=^$ -fuzz=FuzzParserFeed -fuzztime=5s .
 ```
 
-CI also runs a Linux PTY lifecycle smoke test and Linux/ARM64 cross-compilation.
+CI also runs Linux PTY lifecycle tests and Linux/ARM64 cross-compilation; manual
+and `v*` tag-triggered verification cross-compiles test binaries for Linux/macOS
+on amd64/arm64. No workflow creates or publishes a release.
 For visual TUI integration, install `cuetty-cli` and run
 `go test -tags cuetty -run '^TestANSIStressCueTTY$' .`; it regenerates the
 ignored `cuetty-artifacts/ansi-stress/` outputs. See
 [`specs/ansi-stress-cue-tty.md`](specs/ansi-stress-cue-tty.md). The live Pi test
 requires an authenticated Pi installation and is intentionally not part of CI.
-`clipboard_mac_test.go` live tests are macOS-only and skipped by default. They replace
-the system clipboard; run them only explicitly with
-`PORTALIS_RUN_CLIPBOARD_INTEGRATION=1`. Other unit tests are portable.
+`clipboard_mac_test.go` live tests are macOS-only and skipped by default; they replace
+the system clipboard, so run them only explicitly with
+`PORTALIS_RUN_CLIPBOARD_INTEGRATION=1`.
+Other unit tests are portable.
 
 ## License
 

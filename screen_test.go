@@ -16,8 +16,8 @@ var _ legacyScreenResizer = (*Screen)(nil)
 
 func TestResizeUpPreservesContent(t *testing.T) {
 	s := NewScreen(5, 10)
-	for r := 0; r < s.Rows; r++ {
-		for c := 0; c < s.Cols; c++ {
+	for r := 0; r < s.rows; r++ {
+		for c := 0; c < s.cols; c++ {
 			s.Put('X')
 		}
 	}
@@ -40,8 +40,8 @@ func TestResizeUpPreservesContent(t *testing.T) {
 
 func TestSelectionSingleLine(t *testing.T) {
 	s := NewScreen(3, 10)
-	for r := 0; r < s.Rows; r++ {
-		for c := 0; c < s.Cols; c++ {
+	for r := 0; r < s.rows; r++ {
+		for c := 0; c < s.cols; c++ {
 			s.Put('A' + rune(r))
 		}
 	}
@@ -56,10 +56,10 @@ func TestSelectionSingleLine(t *testing.T) {
 func TestSelectionUsesScrollbackViewportOffset(t *testing.T) {
 	s := NewScreen(3, 8)
 	s.scrollback = [][]Cell{
-		cellsFromText("oldest", s.Cols),
-		cellsFromText("newest", s.Cols),
+		cellsFromText("oldest", s.cols),
+		cellsFromText("newest", s.cols),
 	}
-	s.Cells[0] = cellsFromText("current", s.Cols)
+	s.cells[0] = cellsFromText("current", s.cols)
 	s.ScrollViewUp(2)
 
 	// The first visible row is the oldest scrollback line. Mouse coordinates
@@ -85,8 +85,8 @@ func TestSelectionUsesScrollbackViewportOffset(t *testing.T) {
 
 func TestSelectionCanCrossScrollbackAndLiveScreen(t *testing.T) {
 	s := NewScreen(3, 8)
-	s.scrollback = [][]Cell{cellsFromText("before", s.Cols)}
-	s.Cells[0] = cellsFromText("after", s.Cols)
+	s.scrollback = [][]Cell{cellsFromText("before", s.cols)}
+	s.cells[0] = cellsFromText("after", s.cols)
 	s.ScrollViewUp(1)
 
 	s.StartSelection(0, 2)
@@ -111,8 +111,8 @@ func cellsFromText(text string, width int) []Cell {
 
 func TestSelectionMultiLine(t *testing.T) {
 	s := NewScreen(3, 10)
-	for r := 0; r < s.Rows; r++ {
-		for c := 0; c < s.Cols; c++ {
+	for r := 0; r < s.rows; r++ {
+		for c := 0; c < s.cols; c++ {
 			s.Put('A' + rune(r))
 		}
 	}
@@ -129,8 +129,8 @@ func TestSelectionMultiLine(t *testing.T) {
 
 func TestSelectionReverseDirection(t *testing.T) {
 	s := NewScreen(3, 10)
-	for r := 0; r < s.Rows; r++ {
-		for c := 0; c < s.Cols; c++ {
+	for r := 0; r < s.rows; r++ {
+		for c := 0; c < s.cols; c++ {
 			s.Put('A' + rune(r))
 		}
 	}
@@ -145,7 +145,7 @@ func TestSelectionReverseDirection(t *testing.T) {
 
 func TestSelectionExclusiveEndLeft(t *testing.T) {
 	s := NewScreen(1, 10)
-	for c := 0; c < s.Cols; c++ {
+	for c := 0; c < s.cols; c++ {
 		s.Put('A' + rune(c))
 	}
 	// Cells: A B C D E F G H I J (cols 0..9).
@@ -175,13 +175,13 @@ func TestHiddenTextDoesNotLeakThroughCursorOrSelection(t *testing.T) {
 		for _, overlay := range []string{"cursor", "selection"} {
 			t.Run(hidden.name+"/"+overlay, func(t *testing.T) {
 				s := NewScreen(1, 4)
-				s.Cells[0][0] = Cell{Rune: hidden.rune, Style: StyleHidden}
+				s.cells[0][0] = Cell{Rune: hidden.rune, Style: StyleHidden}
 				if hidden.width == 2 {
-					s.Cells[0][1] = Cell{Continuation: true}
+					s.cells[0][1] = Cell{Continuation: true}
 				}
 				if overlay == "cursor" {
-					s.CursorVisible = true
-					s.CursorBlinkVisible = true
+					s.cursorVisible = true
+					s.cursorBlinkVisible = true
 					s.SetCursor(0, 0)
 				} else {
 					selectionCol := 0
@@ -196,8 +196,8 @@ func TestHiddenTextDoesNotLeakThroughCursorOrSelection(t *testing.T) {
 				if strings.Contains(rendered, string(hidden.rune)) {
 					t.Fatalf("hidden rune leaked through %s overlay: %q", overlay, rendered)
 				}
-				if width := ansi.StringWidth(rendered); width != s.Cols {
-					t.Fatalf("render width = %d, want %d", width, s.Cols)
+				if width := ansi.StringWidth(rendered); width != s.cols {
+					t.Fatalf("render width = %d, want %d", width, s.cols)
 				}
 			})
 		}
@@ -207,16 +207,16 @@ func TestHiddenTextDoesNotLeakThroughCursorOrSelection(t *testing.T) {
 func TestWideCursorAndSelectionOverlayCoverContinuation(t *testing.T) {
 	s := NewScreen(1, 4)
 	s.Put('界')
-	s.CursorVisible = true
-	s.CursorBlinkVisible = true
+	s.cursorVisible = true
+	s.cursorBlinkVisible = true
 	s.SetCursor(0, 1)
 
 	cursorFrame := s.Render()
 	if !strings.Contains(cursorFrame, "\x1b[7m界") {
 		t.Fatalf("cursor on continuation did not overlay wide base: %q", cursorFrame)
 	}
-	if width := ansi.StringWidth(cursorFrame); width != s.Cols {
-		t.Fatalf("cursor frame width = %d, want %d", width, s.Cols)
+	if width := ansi.StringWidth(cursorFrame); width != s.cols {
+		t.Fatalf("cursor frame width = %d, want %d", width, s.cols)
 	}
 
 	s.StartSelection(0, 1)
@@ -225,8 +225,8 @@ func TestWideCursorAndSelectionOverlayCoverContinuation(t *testing.T) {
 	if !strings.Contains(selectionFrame, "\x1b[7m界") {
 		t.Fatalf("selection on continuation did not overlay wide base: %q", selectionFrame)
 	}
-	if width := ansi.StringWidth(selectionFrame); width != s.Cols {
-		t.Fatalf("selection frame width = %d, want %d", width, s.Cols)
+	if width := ansi.StringWidth(selectionFrame); width != s.cols {
+		t.Fatalf("selection frame width = %d, want %d", width, s.cols)
 	}
 }
 
@@ -295,7 +295,7 @@ func TestSelectionTextIncludesWideGlyphWhenContinuationIsSelected(t *testing.T) 
 
 func TestSelectionInclusiveEndRight(t *testing.T) {
 	s := NewScreen(1, 10)
-	for c := 0; c < s.Cols; c++ {
+	for c := 0; c < s.cols; c++ {
 		s.Put('A' + rune(c))
 	}
 	// Drag from col 3 (D) to col 7 (H) — rightward, full inclusive.
@@ -335,10 +335,10 @@ func TestResizePreservesAndClampsCustomScrollRegion(t *testing.T) {
 // terminal is narrowed).
 func TestResizeShrinkMovesUpperRowsToScrollbackExactlyOnce(t *testing.T) {
 	s := NewScreen(8, 4)
-	s.scrollback = [][]Cell{cellsFromText("P", s.Cols), cellsFromText("Q", s.Cols)}
+	s.scrollback = [][]Cell{cellsFromText("P", s.cols), cellsFromText("Q", s.cols)}
 	s.viewOffset = 1
-	for row := range s.Cells {
-		s.Cells[row] = cellsFromText(string(rune('A'+row)), s.Cols)
+	for row := range s.cells {
+		s.cells[row] = cellsFromText(string(rune('A'+row)), s.cols)
 	}
 	s.SetScrollRegion(3, 7)
 	s.SetCursor(5, 0)
@@ -347,11 +347,11 @@ func TestResizeShrinkMovesUpperRowsToScrollbackExactlyOnce(t *testing.T) {
 		t.Fatal(err)
 	}
 	if got := []rune{
-		s.Cells[0][0].Rune,
-		s.Cells[1][0].Rune,
-		s.Cells[2][0].Rune,
-		s.Cells[3][0].Rune,
-		s.Cells[4][0].Rune,
+		s.cells[0][0].Rune,
+		s.cells[1][0].Rune,
+		s.cells[2][0].Rune,
+		s.cells[3][0].Rune,
+		s.cells[4][0].Rune,
 	}; string(got) != "DEFGH" {
 		t.Fatalf("surviving lower rows = %q, want DEFGH", string(got))
 	}
@@ -393,10 +393,10 @@ func TestResizeShrinkMovesUpperRowsToScrollbackExactlyOnce(t *testing.T) {
 		t.Fatalf("successive shrink scrollback = %q, want PQABCD", string(got))
 	}
 	if got := []rune{
-		s.Cells[0][0].Rune,
-		s.Cells[1][0].Rune,
-		s.Cells[2][0].Rune,
-		s.Cells[3][0].Rune,
+		s.cells[0][0].Rune,
+		s.cells[1][0].Rune,
+		s.cells[2][0].Rune,
+		s.cells[3][0].Rune,
 	}; string(got) != "EFGH" {
 		t.Fatalf("surviving rows after second shrink = %q, want EFGH", string(got))
 	}
@@ -404,8 +404,8 @@ func TestResizeShrinkMovesUpperRowsToScrollbackExactlyOnce(t *testing.T) {
 
 func TestAltResizeMovesPrimaryUpperRowsToScrollback(t *testing.T) {
 	s := NewScreen(6, 4)
-	for row := range s.Cells {
-		s.Cells[row] = cellsFromText(string(rune('A'+row)), s.Cols)
+	for row := range s.cells {
+		s.cells[row] = cellsFromText(string(rune('A'+row)), s.cols)
 	}
 	s.SetScrollRegion(2, 5)
 	s.SetCursor(4, 0)
@@ -416,10 +416,10 @@ func TestAltResizeMovesPrimaryUpperRowsToScrollback(t *testing.T) {
 	}
 	s.ExitAltScreen()
 	if got := []rune{
-		s.Cells[0][0].Rune,
-		s.Cells[1][0].Rune,
-		s.Cells[2][0].Rune,
-		s.Cells[3][0].Rune,
+		s.cells[0][0].Rune,
+		s.cells[1][0].Rune,
+		s.cells[2][0].Rune,
+		s.cells[3][0].Rune,
 	}; string(got) != "CDEF" {
 		t.Fatalf("restored lower primary rows = %q, want CDEF", string(got))
 	}
@@ -437,12 +437,12 @@ func TestAltResizeMovesPrimaryUpperRowsToScrollback(t *testing.T) {
 func TestResizeShrinkTruncatesScrollback(t *testing.T) {
 	s := NewScreen(3, 20)
 	// Fill the first line so that the next Newline scrolls it into scrollback.
-	for c := 0; c < s.Cols; c++ {
+	for c := 0; c < s.cols; c++ {
 		s.Put('A')
 	}
 	s.NextLine()
 	// One more line, also scrolled off.
-	for c := 0; c < s.Cols; c++ {
+	for c := 0; c < s.cols; c++ {
 		s.Put('B')
 	}
 	s.NextLine()
@@ -469,10 +469,10 @@ func TestResizeShrinkTruncatesScrollback(t *testing.T) {
 
 // TestResizeGrowPadsScrollback verifies that scrollback lines saved at a
 // narrower width are padded with blank cells so the renderer can index up to
-// s.Cols without reading past the slice.
+// s.cols without reading past the slice.
 func TestResizeGrowPadsScrollback(t *testing.T) {
 	s := NewScreen(3, 5)
-	for c := 0; c < s.Cols; c++ {
+	for c := 0; c < s.cols; c++ {
 		s.Put('X')
 	}
 	s.NextLine()
@@ -518,7 +518,7 @@ func TestResizeScrollbackDropsDanglingContinuation(t *testing.T) {
 	s.SetCursor(0, 0)
 	s.Put('A')
 	s.Put('日')
-	for c := 2; c < s.Cols-1; c++ {
+	for c := 2; c < s.cols-1; c++ {
 		s.Put('Z')
 	}
 	// Pad the last cell so wrapPending doesn't trigger another newline.
@@ -565,7 +565,7 @@ func TestResizeScrollbackDropsDanglingContinuation(t *testing.T) {
 
 func TestClearLineResetsWrapPending(t *testing.T) {
 	s := NewScreen(3, 5)
-	for c := 0; c < s.Cols; c++ {
+	for c := 0; c < s.cols; c++ {
 		s.Put('X')
 	}
 	if !s.wrapPending {
@@ -578,11 +578,11 @@ func TestClearLineResetsWrapPending(t *testing.T) {
 
 	// After clearing the line and resetting wrapPending, writing a character
 	// should stay on the same row instead of wrapping to the next line.
-	if s.Cursor.Row != 0 || s.Cursor.Col != 1 {
-		t.Errorf("cursor moved unexpectedly: row=%d col=%d", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 0 || s.cursor.Col != 1 {
+		t.Errorf("cursor moved unexpectedly: row=%d col=%d", s.cursor.Row, s.cursor.Col)
 	}
-	if s.Cells[0][0].Rune != 'Y' {
-		t.Errorf("expected Y at (0,0), got %q", s.Cells[0][0].Rune)
+	if s.cells[0][0].Rune != 'Y' {
+		t.Errorf("expected Y at (0,0), got %q", s.cells[0][0].Rune)
 	}
 }
 
@@ -644,12 +644,12 @@ func BenchmarkParserTmuxFrame(b *testing.B) {
 
 // RenderLine returns the raw content of a single row for testing.
 func (s *Screen) RenderLine(r int) string {
-	if r < 0 || r >= s.Rows {
+	if r < 0 || r >= s.rows {
 		return ""
 	}
 	var b strings.Builder
-	for c := 0; c < s.Cols; c++ {
-		cell := s.Cells[r][c]
+	for c := 0; c < s.cols; c++ {
+		cell := s.cells[r][c]
 		if cell.Continuation {
 			continue
 		}
@@ -668,14 +668,14 @@ func TestPutWideRuneUsesTwoCells(t *testing.T) {
 	s.Put('✅')
 	s.Put('A')
 
-	if !s.Cells[0][1].Continuation {
+	if !s.cells[0][1].Continuation {
 		t.Fatal("wide rune did not create a continuation cell")
 	}
-	if s.Cells[0][2].Rune != 'A' {
-		t.Fatalf("A written at column %d, want 2", s.Cursor.Col-1)
+	if s.cells[0][2].Rune != 'A' {
+		t.Fatalf("A written at column %d, want 2", s.cursor.Col-1)
 	}
-	if s.Cursor.Col != 3 {
-		t.Fatalf("cursor column = %d, want 3", s.Cursor.Col)
+	if s.cursor.Col != 3 {
+		t.Fatalf("cursor column = %d, want 3", s.cursor.Col)
 	}
 	if got := ansi.StringWidth(s.RenderLine(0)); got != 4 {
 		t.Fatalf("rendered width = %d, want 4; line=%q", got, s.RenderLine(0))
@@ -688,8 +688,8 @@ func TestPutCombiningMarkDoesNotAdvanceCursor(t *testing.T) {
 	s.Put('\u0301')
 	s.Put('A')
 
-	if s.Cursor.Col != 2 {
-		t.Fatalf("cursor column = %d, want 2", s.Cursor.Col)
+	if s.cursor.Col != 2 {
+		t.Fatalf("cursor column = %d, want 2", s.cursor.Col)
 	}
 	if got := s.RenderLine(0); got != "éA  " {
 		t.Fatalf("rendered line = %q, want %q", got, "éA  ")
@@ -704,11 +704,11 @@ func TestVariationSelectorExpandsPreviousCell(t *testing.T) {
 	s.Put('❤')
 	s.Put('\ufe0f')
 
-	if !s.Cells[0][1].Continuation {
+	if !s.cells[0][1].Continuation {
 		t.Fatal("emoji variation did not create a continuation cell")
 	}
-	if s.Cursor.Col != 2 {
-		t.Fatalf("cursor column = %d, want 2", s.Cursor.Col)
+	if s.cursor.Col != 2 {
+		t.Fatalf("cursor column = %d, want 2", s.cursor.Col)
 	}
 	if got := ansi.StringWidth(s.RenderLine(0)); got != 4 {
 		t.Fatalf("rendered width = %d, want 4; line=%q", got, s.RenderLine(0))
@@ -724,11 +724,11 @@ func TestEmojiClustersStayInOneWideCell(t *testing.T) {
 			}
 			s.Put('A')
 
-			if s.Cursor.Col != 3 {
-				t.Fatalf("cursor column = %d, want 3", s.Cursor.Col)
+			if s.cursor.Col != 3 {
+				t.Fatalf("cursor column = %d, want 3", s.cursor.Col)
 			}
-			if s.Cells[0][2].Rune != 'A' {
-				t.Fatalf("A cell = %+v, want column 2", s.Cells[0][2])
+			if s.cells[0][2].Rune != 'A' {
+				t.Fatalf("A cell = %+v, want column 2", s.cells[0][2])
 			}
 			if got := ansi.StringWidth(s.RenderLine(0)); got != 4 {
 				t.Fatalf("rendered width = %d, want 4; line=%q", got, s.RenderLine(0))
@@ -759,17 +759,17 @@ func TestGraphemeClustersAtRightEdgeStayTogether(t *testing.T) {
 			for _, r := range test.cluster {
 				s.Put(r)
 			}
-			if got := cellText(s.Cells[0][startCol]); got != test.cluster {
+			if got := cellText(s.cells[0][startCol]); got != test.cluster {
 				t.Fatalf("right-edge grapheme = %q, want %q", got, test.cluster)
 			}
 			if !s.wrapPending {
 				t.Fatal("cluster ending at right edge did not retain pending wrap")
 			}
 			s.Put('Z')
-			if got := s.Cells[1][0].Rune; got != 'Z' {
+			if got := s.cells[1][0].Rune; got != 'Z' {
 				t.Fatalf("next rune = %q, want wrapped Z", got)
 			}
-			if got := cellText(s.Cells[0][startCol]); got != test.cluster {
+			if got := cellText(s.cells[0][startCol]); got != test.cluster {
 				t.Fatalf("right-edge grapheme split after wrap: %q", got)
 			}
 		})
@@ -785,11 +785,11 @@ func TestVariationSelectorWidensPendingRightEdgeGrapheme(t *testing.T) {
 	if got := s.RenderLine(0); got != "xxx " {
 		t.Fatalf("first line = %q, want base moved as a whole", got)
 	}
-	if got := cellText(s.Cells[1][0]); got != "❤️" || !s.Cells[1][1].Continuation {
-		t.Fatalf("widened grapheme on next row = %+v, want complete wide heart", s.Cells[1][:2])
+	if got := cellText(s.cells[1][0]); got != "❤️" || !s.cells[1][1].Continuation {
+		t.Fatalf("widened grapheme on next row = %+v, want complete wide heart", s.cells[1][:2])
 	}
-	if s.Cursor.Row != 1 || s.Cursor.Col != 2 {
-		t.Fatalf("cursor after grapheme reflow = (%d,%d), want (1,2)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 2 {
+		t.Fatalf("cursor after grapheme reflow = (%d,%d), want (1,2)", s.cursor.Row, s.cursor.Col)
 	}
 }
 
@@ -799,11 +799,11 @@ func TestOverwriteWideContinuationClearsWholeGlyph(t *testing.T) {
 	s.SetCursor(0, 1)
 	s.Put('X')
 
-	if s.Cells[0][0].Rune != 0 {
-		t.Fatalf("wide base survived continuation overwrite: %q", s.Cells[0][0].Rune)
+	if s.cells[0][0].Rune != 0 {
+		t.Fatalf("wide base survived continuation overwrite: %q", s.cells[0][0].Rune)
 	}
-	if s.Cells[0][1].Rune != 'X' || s.Cells[0][1].Continuation {
-		t.Fatalf("replacement cell = %+v, want X base cell", s.Cells[0][1])
+	if s.cells[0][1].Rune != 'X' || s.cells[0][1].Continuation {
+		t.Fatalf("replacement cell = %+v, want X base cell", s.cells[0][1])
 	}
 	if got := ansi.StringWidth(s.RenderLine(0)); got != 4 {
 		t.Fatalf("rendered width = %d, want 4", got)
@@ -816,8 +816,8 @@ func TestClearWideContinuationClearsWholeGlyph(t *testing.T) {
 	s.SetCursor(0, 1)
 	s.ClearLine()
 
-	if s.Cells[0][0].Rune != 0 || s.Cells[0][1].Continuation {
-		t.Fatalf("wide glyph survived clear: %+v", s.Cells[0][:2])
+	if s.cells[0][0].Rune != 0 || s.cells[0][1].Continuation {
+		t.Fatalf("wide glyph survived clear: %+v", s.cells[0][:2])
 	}
 }
 
@@ -832,8 +832,8 @@ func TestWideRuneWrapsBeforeLastColumn(t *testing.T) {
 	if got := s.RenderLine(1); got != "✅  " {
 		t.Fatalf("second line = %q, want %q", got, "✅  ")
 	}
-	if s.Cursor.Row != 1 || s.Cursor.Col != 2 {
-		t.Fatalf("cursor = (%d,%d), want (1,2)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 2 {
+		t.Fatalf("cursor = (%d,%d), want (1,2)", s.cursor.Row, s.cursor.Col)
 	}
 }
 
@@ -843,8 +843,8 @@ func TestPutBytesClearsWideBoundary(t *testing.T) {
 	s.SetCursor(0, 1)
 	s.PutBytes([]byte("xy"))
 
-	if s.Cells[0][0].Rune != 0 {
-		t.Fatalf("wide base survived ASCII overwrite: %q", s.Cells[0][0].Rune)
+	if s.cells[0][0].Rune != 0 {
+		t.Fatalf("wide base survived ASCII overwrite: %q", s.cells[0][0].Rune)
 	}
 	if got := s.RenderLine(0); got != " xy  " {
 		t.Fatalf("rendered line = %q, want %q", got, " xy  ")
@@ -857,14 +857,14 @@ func TestPutBytesBasic(t *testing.T) {
 	if n != 5 {
 		t.Fatalf("expected 5 consumed, got %d", n)
 	}
-	if got := s.Cells[0][0].Rune; got != 'h' {
+	if got := s.cells[0][0].Rune; got != 'h' {
 		t.Errorf("cell 0,0 = %q, want 'h'", got)
 	}
-	if got := s.Cells[0][4].Rune; got != 'o' {
+	if got := s.cells[0][4].Rune; got != 'o' {
 		t.Errorf("cell 0,4 = %q, want 'o'", got)
 	}
-	if s.Cursor.Col != 5 {
-		t.Errorf("cursor col = %d, want 5", s.Cursor.Col)
+	if s.cursor.Col != 5 {
+		t.Errorf("cursor col = %d, want 5", s.cursor.Col)
 	}
 	if s.wrapPending {
 		t.Errorf("wrapPending should be false")
@@ -880,8 +880,8 @@ func TestPutBytesWrapAtRowEnd(t *testing.T) {
 	if !s.wrapPending {
 		t.Fatalf("expected wrapPending after filling row")
 	}
-	if s.Cursor.Col != 4 {
-		t.Errorf("cursor col = %d, want 4 (last column)", s.Cursor.Col)
+	if s.cursor.Col != 4 {
+		t.Errorf("cursor col = %d, want 4 (last column)", s.cursor.Col)
 	}
 	// Next call should wrap and write on next row.
 	n = s.PutBytes([]byte("X"))
@@ -891,7 +891,7 @@ func TestPutBytesWrapAtRowEnd(t *testing.T) {
 	if s.wrapPending {
 		t.Errorf("wrapPending should clear after wrap")
 	}
-	if got := s.Cells[1][0].Rune; got != 'X' {
+	if got := s.cells[1][0].Rune; got != 'X' {
 		t.Errorf("cell 1,0 = %q, want 'X'", got)
 	}
 }
@@ -943,7 +943,7 @@ func TestSyncSelectionOverlaysCommittedFrameWithoutCommitting(t *testing.T) {
 
 func TestSyncSelectionKeepsCommittedCursorAcrossParserMutation(t *testing.T) {
 	s := NewScreen(1, 4)
-	s.CursorBlinkVisible = true
+	s.cursorBlinkVisible = true
 	p := NewParser(s)
 	p.Feed([]byte("AB"))
 	s.Render()
@@ -982,17 +982,17 @@ func TestCJKSequenceCursorPosition(t *testing.T) {
 	s := NewScreen(2, 10)
 	// Write two CJK characters: 你 (col 0-1), 好 (col 2-3)
 	s.Put('你')
-	if s.Cursor.Col != 2 {
-		t.Fatalf("after 你: cursor col = %d, want 2", s.Cursor.Col)
+	if s.cursor.Col != 2 {
+		t.Fatalf("after 你: cursor col = %d, want 2", s.cursor.Col)
 	}
 	s.Put('好')
-	if s.Cursor.Col != 4 {
-		t.Fatalf("after 好: cursor col = %d, want 4", s.Cursor.Col)
+	if s.cursor.Col != 4 {
+		t.Fatalf("after 好: cursor col = %d, want 4", s.cursor.Col)
 	}
 	// Write ASCII after CJK
 	s.Put('A')
-	if s.Cursor.Col != 5 {
-		t.Fatalf("after A: cursor col = %d, want 5", s.Cursor.Col)
+	if s.cursor.Col != 5 {
+		t.Fatalf("after A: cursor col = %d, want 5", s.cursor.Col)
 	}
 	if got := s.RenderLine(0); got != "你好A     " {
 		t.Fatalf("line 0 = %q (len=%d), want %q", got, len(got), "你好A     ")
@@ -1005,13 +1005,13 @@ func TestEmojiSequenceCursorPosition(t *testing.T) {
 	for _, r := range "👍🏽" {
 		s.Put(r)
 	}
-	if s.Cursor.Col != 2 {
-		t.Fatalf("after 👍🏽: cursor col = %d, want 2", s.Cursor.Col)
+	if s.cursor.Col != 2 {
+		t.Fatalf("after 👍🏽: cursor col = %d, want 2", s.cursor.Col)
 	}
 	// Write ASCII after emoji
 	s.Put('A')
-	if s.Cursor.Col != 3 {
-		t.Fatalf("after A: cursor col = %d, want 3", s.Cursor.Col)
+	if s.cursor.Col != 3 {
+		t.Fatalf("after A: cursor col = %d, want 3", s.cursor.Col)
 	}
 	if got := s.RenderLine(0); got != "👍🏽A       " {
 		t.Fatalf("line 0 = %q (len=%d), want %q", got, len(got), "👍🏽A       ")
@@ -1028,13 +1028,13 @@ func TestMixedCJKAndASCIIWrapsCorrectly(t *testing.T) {
 	if !s.wrapPending {
 		t.Fatal("expected wrapPending after filling row")
 	}
-	if s.Cursor.Col != 5 {
-		t.Fatalf("cursor col = %d, want 5 (clamped)", s.Cursor.Col)
+	if s.cursor.Col != 5 {
+		t.Fatalf("cursor col = %d, want 5 (clamped)", s.cursor.Col)
 	}
 	// Next char should wrap to next line
 	s.Put('C')
-	if s.Cursor.Row != 1 || s.Cursor.Col != 1 {
-		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 1 {
+		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.cursor.Row, s.cursor.Col)
 	}
 	if got := s.RenderLine(0); got != "你好AB" {
 		t.Fatalf("line 0 = %q, want %q", got, "你好AB")
@@ -1054,17 +1054,17 @@ func TestWideCharAtSecondToLastColumn(t *testing.T) {
 	if !s.wrapPending {
 		t.Fatal("expected wrapPending after wide at col 3 (cursor past edge)")
 	}
-	if s.Cursor.Col != 4 {
-		t.Fatalf("cursor col = %d, want 4 (clamped)", s.Cursor.Col)
+	if s.cursor.Col != 4 {
+		t.Fatalf("cursor col = %d, want 4 (clamped)", s.cursor.Col)
 	}
 	// Verify continuation cell
-	if !s.Cells[0][4].Continuation {
+	if !s.cells[0][4].Continuation {
 		t.Fatal("expected continuation cell at col 4")
 	}
 	// Next char should wrap
 	s.Put('X')
-	if s.Cursor.Row != 1 || s.Cursor.Col != 1 {
-		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 1 {
+		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.cursor.Row, s.cursor.Col)
 	}
 	if got := s.RenderLine(0); got != "ABC✅" {
 		t.Fatalf("line 0 = %q, want %q", got, "ABC✅")
@@ -1092,20 +1092,20 @@ func TestCombiningAfterWideAtEndOfLine(t *testing.T) {
 	if !s.wrapPending {
 		t.Fatal("wrapPending should remain after variation selector")
 	}
-	if s.Cursor.Col != 4 {
-		t.Fatalf("cursor col = %d, want 4", s.Cursor.Col)
+	if s.cursor.Col != 4 {
+		t.Fatalf("cursor col = %d, want 4", s.cursor.Col)
 	}
 	// Verify the variation selector was appended
 	// Note: ❤ (U+2764) is already emoji-width (2), so the variation selector
 	// is appended to Combining. The exact combining string depends on uniseg
 	// version; just check it's non-empty.
-	if s.Cells[0][3].Combining == "" {
+	if s.cells[0][3].Combining == "" {
 		t.Fatal("expected variation selector in Combining, got empty")
 	}
 	// Next char should wrap
 	s.Put('X')
-	if s.Cursor.Row != 1 || s.Cursor.Col != 1 {
-		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 1 {
+		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.cursor.Row, s.cursor.Col)
 	}
 }
 
@@ -1120,13 +1120,13 @@ func TestMultipleLinesOfMixedContent(t *testing.T) {
 	}
 	// ✅ wraps to line 1, col 0-1
 	s.Put('✅')
-	if s.Cursor.Row != 1 || s.Cursor.Col != 2 {
-		t.Fatalf("after ✅ wrap: cursor = (%d,%d), want (1,2)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 2 {
+		t.Fatalf("after ✅ wrap: cursor = (%d,%d), want (1,2)", s.cursor.Row, s.cursor.Col)
 	}
 	// E at line 1, col 2
 	s.Put('E')
-	if s.Cursor.Row != 1 || s.Cursor.Col != 3 {
-		t.Fatalf("after E: cursor = (%d,%d), want (1,3)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 3 {
+		t.Fatalf("after E: cursor = (%d,%d), want (1,3)", s.cursor.Row, s.cursor.Col)
 	}
 	if got := s.RenderLine(0); got != "你好ABCD" {
 		t.Fatalf("line 0 = %q, want %q", got, "你好ABCD")
@@ -1145,8 +1145,8 @@ func TestWideCharAtLastColumnWraps(t *testing.T) {
 	s.PutBytes([]byte("ABCD"))
 	// Wide char at col 4 (last column) should wrap to next line
 	s.Put('✅')
-	if s.Cursor.Row != 1 || s.Cursor.Col != 2 {
-		t.Fatalf("cursor = (%d,%d), want (1,2)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 2 {
+		t.Fatalf("cursor = (%d,%d), want (1,2)", s.cursor.Row, s.cursor.Col)
 	}
 	if got := s.RenderLine(0); got != "ABCD " {
 		t.Fatalf("line 0 = %q, want %q", got, "ABCD ")
@@ -1164,13 +1164,13 @@ func TestEmojiWithSkinToneThenASCII(t *testing.T) {
 	}
 	// Write another emoji: 🎉 (2 cols)
 	s.Put('🎉')
-	if s.Cursor.Col != 4 {
-		t.Fatalf("cursor col = %d, want 4", s.Cursor.Col)
+	if s.cursor.Col != 4 {
+		t.Fatalf("cursor col = %d, want 4", s.cursor.Col)
 	}
 	// Write ASCII
 	s.Put('A')
-	if s.Cursor.Col != 5 {
-		t.Fatalf("cursor col = %d, want 5", s.Cursor.Col)
+	if s.cursor.Col != 5 {
+		t.Fatalf("cursor col = %d, want 5", s.cursor.Col)
 	}
 	// 👍🏽(2) + 🎉(2) + A(1) = 5 visible cols, 5 empty = 10 cols
 	if got := s.RenderLine(0); got != "👍🏽🎉A     " {
@@ -1184,13 +1184,13 @@ func TestCJKThenEmojiThenASCII(t *testing.T) {
 	s.Put('你')
 	// Write emoji: 🎉 (2 cols)
 	s.Put('🎉')
-	if s.Cursor.Col != 4 {
-		t.Fatalf("cursor col = %d, want 4", s.Cursor.Col)
+	if s.cursor.Col != 4 {
+		t.Fatalf("cursor col = %d, want 4", s.cursor.Col)
 	}
 	// Write ASCII
 	s.Put('A')
-	if s.Cursor.Col != 5 {
-		t.Fatalf("cursor col = %d, want 5", s.Cursor.Col)
+	if s.cursor.Col != 5 {
+		t.Fatalf("cursor col = %d, want 5", s.cursor.Col)
 	}
 	// 你(2) + 🎉(2) + A(1) = 5 visible cols, 5 empty = 10 cols
 	if got := s.RenderLine(0); got != "你🎉A     " {
@@ -1214,7 +1214,7 @@ func TestPiTUIStyleStreaming(t *testing.T) {
 			case '\n':
 				s.Index()
 			case '\r':
-				s.Cursor.Col = 0
+				s.cursor.Col = 0
 			default:
 				s.Put(r)
 			}
@@ -1256,7 +1256,7 @@ func TestCursorDriftWithWideChars(t *testing.T) {
 			s.Put(r)
 		}
 		s.Index()        // \n
-		s.Cursor.Col = 0 // \r
+		s.cursor.Col = 0 // \r
 	}
 
 	lines := []string{
@@ -1272,8 +1272,8 @@ func TestCursorDriftWithWideChars(t *testing.T) {
 	}
 
 	// Cursor should be on row 5 (after 5 lines, 0-indexed)
-	if s.Cursor.Row != 5 {
-		t.Fatalf("cursor row = %d, want 5", s.Cursor.Row)
+	if s.cursor.Row != 5 {
+		t.Fatalf("cursor row = %d, want 5", s.cursor.Row)
 	}
 
 	// Check that each line renders correctly
@@ -1302,8 +1302,8 @@ func TestWideCharWrapDoesNotDriftCursor(t *testing.T) {
 	}
 	// Next char wraps to line 1
 	s.Put('X')
-	if s.Cursor.Row != 1 || s.Cursor.Col != 1 {
-		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 1 {
+		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.cursor.Row, s.cursor.Col)
 	}
 
 	// Write more chars on line 1
@@ -1313,13 +1313,13 @@ func TestWideCharWrapDoesNotDriftCursor(t *testing.T) {
 	// Wide char at col 9 (last column) — wraps to line 2
 	s.Put('🔥')
 	// 🔥 is at line 2, col 0-1. Cursor at col 2.
-	if s.Cursor.Row != 2 || s.Cursor.Col != 2 {
-		t.Fatalf("after 🔥 wrap: cursor = (%d,%d), want (2,2)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 2 || s.cursor.Col != 2 {
+		t.Fatalf("after 🔥 wrap: cursor = (%d,%d), want (2,2)", s.cursor.Row, s.cursor.Col)
 	}
 	// Next char at col 2
 	s.Put('Y')
-	if s.Cursor.Row != 2 || s.Cursor.Col != 3 {
-		t.Fatalf("after Y: cursor = (%d,%d), want (2,3)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 2 || s.cursor.Col != 3 {
+		t.Fatalf("after Y: cursor = (%d,%d), want (2,3)", s.cursor.Row, s.cursor.Col)
 	}
 	// Verify line 0
 	if got := s.RenderLine(0); got != "ABCDEFGH✅" {
@@ -1354,8 +1354,8 @@ func TestParserWideCharsThroughParser(t *testing.T) {
 	feed("Line with 👍🏽 skin tone emoji\r\n")
 
 	// Cursor should be on row 4 (after 4 lines + \r\n on last line, 0-indexed)
-	if s.Cursor.Row != 4 {
-		t.Fatalf("cursor row = %d, want 4", s.Cursor.Row)
+	if s.cursor.Row != 4 {
+		t.Fatalf("cursor row = %d, want 4", s.cursor.Row)
 	}
 
 	// Verify each line contains the expected content
@@ -1388,8 +1388,8 @@ func TestParserCursorAfterWideChars(t *testing.T) {
 
 	// Next char wraps to line 1
 	p.Feed([]byte("X"))
-	if s.Cursor.Row != 1 || s.Cursor.Col != 1 {
-		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.Cursor.Row, s.Cursor.Col)
+	if s.cursor.Row != 1 || s.cursor.Col != 1 {
+		t.Fatalf("after wrap: cursor = (%d,%d), want (1,1)", s.cursor.Row, s.cursor.Col)
 	}
 
 	// Verify line 0
@@ -1428,8 +1428,8 @@ func TestParserSpinnerWithWideChars(t *testing.T) {
 	t.Logf("Rendered:\n%s", rendered)
 
 	// Cursor should be on row 5 (after 5 lines + \r\n on last line, 0-indexed)
-	if s.Cursor.Row != 5 {
-		t.Fatalf("cursor row = %d, want 5", s.Cursor.Row)
+	if s.cursor.Row != 5 {
+		t.Fatalf("cursor row = %d, want 5", s.cursor.Row)
 	}
 }
 
@@ -1443,11 +1443,11 @@ func TestAltScreenResizePreservesPrimaryDimensions(t *testing.T) {
 	s.Put('X')
 	s.ExitAltScreen()
 
-	if s.Rows != 6 || s.Cols != 10 {
-		t.Fatalf("screen dimensions = %dx%d, want 6x10", s.Rows, s.Cols)
+	if s.rows != 6 || s.cols != 10 {
+		t.Fatalf("screen dimensions = %dx%d, want 6x10", s.rows, s.cols)
 	}
-	if len(s.Cells) != 6 || len(s.Cells[0]) != 10 {
-		t.Fatalf("restored grid dimensions = %dx%d, want 6x10", len(s.Cells), len(s.Cells[0]))
+	if len(s.cells) != 6 || len(s.cells[0]) != 10 {
+		t.Fatalf("restored grid dimensions = %dx%d, want 6x10", len(s.cells), len(s.cells[0]))
 	}
 	if got := s.RenderLine(0); !strings.HasPrefix(got, "hello") {
 		t.Fatalf("primary screen content lost after alt resize: %q", got)
@@ -1523,27 +1523,27 @@ func TestGraphemeCombiningDataIsBounded(t *testing.T) {
 	for i := 0; i < maxGraphemeBytes*4; i++ {
 		s.Put('́')
 	}
-	if got := len(s.Cells[0][0].Combining); got > maxGraphemeBytes {
+	if got := len(s.cells[0][0].Combining); got > maxGraphemeBytes {
 		t.Fatalf("combining data grew to %d bytes, limit %d", got, maxGraphemeBytes)
 	}
-	if s.Cursor.Col != 1 {
-		t.Fatalf("combining flood moved cursor to %d", s.Cursor.Col)
+	if s.cursor.Col != 1 {
+		t.Fatalf("combining flood moved cursor to %d", s.cursor.Col)
 	}
 }
 
 func TestScreenDimensionsNormalizeConstructionAndRejectInvalidResize(t *testing.T) {
 	s := NewScreen(0, -5)
-	if s.Rows != 1 || s.Cols != 1 {
-		t.Fatalf("NewScreen normalized to %dx%d, want 1x1", s.Rows, s.Cols)
+	if s.rows != 1 || s.cols != 1 {
+		t.Fatalf("NewScreen normalized to %dx%d, want 1x1", s.rows, s.cols)
 	}
 	if err := s.ResizeChecked(0, 0); err == nil {
 		t.Fatal("Resize(0, 0) unexpectedly succeeded")
 	}
-	if s.Rows != 1 || s.Cols != 1 {
-		t.Fatalf("invalid resize changed dimensions to %dx%d", s.Rows, s.Cols)
+	if s.rows != 1 || s.cols != 1 {
+		t.Fatalf("invalid resize changed dimensions to %dx%d", s.rows, s.cols)
 	}
-	if s.Cursor.Row < 0 || s.Cursor.Col < 0 {
-		t.Fatalf("cursor became negative: %+v", s.Cursor)
+	if s.cursor.Row < 0 || s.cursor.Col < 0 {
+		t.Fatalf("cursor became negative: %+v", s.cursor)
 	}
 }
 
@@ -1563,8 +1563,8 @@ func TestResizeRejectsHugeDimensions(t *testing.T) {
 		if err := s.ResizeChecked(size[0], size[1]); err == nil {
 			t.Errorf("Resize(%d, %d) unexpectedly succeeded", size[0], size[1])
 		}
-		if s.Rows != 2 || s.Cols != 3 {
-			t.Fatalf("invalid Resize(%d, %d) changed dimensions to %dx%d", size[0], size[1], s.Rows, s.Cols)
+		if s.rows != 2 || s.cols != 3 {
+			t.Fatalf("invalid Resize(%d, %d) changed dimensions to %dx%d", size[0], size[1], s.rows, s.cols)
 		}
 	}
 }
@@ -1575,16 +1575,16 @@ func TestResizeAcceptsMaximumSingleDimension(t *testing.T) {
 		if err := s.ResizeChecked(size[0], size[1]); err != nil {
 			t.Fatalf("Resize(%d, %d): %v", size[0], size[1], err)
 		}
-		if s.Rows != size[0] || s.Cols != size[1] {
-			t.Fatalf("screen dimensions = %dx%d, want %dx%d", s.Rows, s.Cols, size[0], size[1])
+		if s.rows != size[0] || s.cols != size[1] {
+			t.Fatalf("screen dimensions = %dx%d, want %dx%d", s.rows, s.cols, size[0], size[1])
 		}
 	}
 }
 
 func TestNewScreenFallsBackForOversizedArea(t *testing.T) {
 	s := NewScreen(1000000, 1000000)
-	if s.Rows != defaultTerminalRows || s.Cols != defaultTerminalCols {
-		t.Fatalf("oversized constructor dimensions = %dx%d, want %dx%d", s.Rows, s.Cols, defaultTerminalRows, defaultTerminalCols)
+	if s.rows != defaultTerminalRows || s.cols != defaultTerminalCols {
+		t.Fatalf("oversized constructor dimensions = %dx%d, want %dx%d", s.rows, s.cols, defaultTerminalRows, defaultTerminalCols)
 	}
 }
 
@@ -1645,11 +1645,11 @@ func TestAltScreenRestoresScrollRegionAndModes(t *testing.T) {
 
 func TestBackgroundColorEraseUsesCurrentBackground(t *testing.T) {
 	s := NewScreen(2, 5)
-	s.Cursor.BG = lipgloss.Color("#123456")
+	s.cursor.BG = lipgloss.Color("#123456")
 	s.Put('X')
 	s.SetCursor(0, 0)
 	s.ClearLineAll()
-	for col, cell := range s.Cells[0] {
+	for col, cell := range s.cells[0] {
 		if cell.Rune != 0 {
 			t.Fatalf("cleared cell %d still has rune %q", col, cell.Rune)
 		}
@@ -1674,17 +1674,17 @@ func TestResizeScrollbackDropsWideBaseCutAtEdge(t *testing.T) {
 
 func TestSaveRestoreCursorPreservesRenditionAndModes(t *testing.T) {
 	s := NewScreen(4, 8)
-	s.Cursor.FG = lipgloss.Color("#111111")
-	s.Cursor.BG = lipgloss.Color("#222222")
-	s.Cursor.Style = StyleBold | StyleUnderline
+	s.cursor.FG = lipgloss.Color("#111111")
+	s.cursor.BG = lipgloss.Color("#222222")
+	s.cursor.Style = StyleBold | StyleUnderline
 	s.SetOriginMode(true)
 	s.SetAutoWrap(false)
 	s.SetCursor(2, 3)
 	s.SaveCursor()
 
-	s.Cursor.FG = ""
-	s.Cursor.BG = ""
-	s.Cursor.Style = 0
+	s.cursor.FG = ""
+	s.cursor.BG = ""
+	s.cursor.Style = 0
 	s.SetOriginMode(false)
 	s.SetAutoWrap(true)
 	s.SetCursor(0, 0)
@@ -1693,11 +1693,11 @@ func TestSaveRestoreCursorPreservesRenditionAndModes(t *testing.T) {
 	if row, col := s.CursorPos(); row != 2 || col != 3 {
 		t.Fatalf("restored cursor = %d,%d, want 2,3", row, col)
 	}
-	if s.Cursor.FG != lipgloss.Color("#111111") || s.Cursor.BG != lipgloss.Color("#222222") {
-		t.Fatalf("restored colors = fg:%q bg:%q", s.Cursor.FG, s.Cursor.BG)
+	if s.cursor.FG != lipgloss.Color("#111111") || s.cursor.BG != lipgloss.Color("#222222") {
+		t.Fatalf("restored colors = fg:%q bg:%q", s.cursor.FG, s.cursor.BG)
 	}
-	if s.Cursor.Style != StyleBold|StyleUnderline {
-		t.Fatalf("restored style = %v", s.Cursor.Style)
+	if s.cursor.Style != StyleBold|StyleUnderline {
+		t.Fatalf("restored style = %v", s.cursor.Style)
 	}
 	if !s.originMode || s.autoWrap {
 		t.Fatalf("restored modes origin=%v autowrap=%v", s.originMode, s.autoWrap)

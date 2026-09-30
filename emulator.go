@@ -35,8 +35,8 @@ type ResizeMsg struct {
 // and renders the output. It is independent of any UI framework; hosts feed it
 // keyboard/mouse/resize messages and call View(width, height) to render it.
 type Emulator struct {
-	SessionID string
-	ChatName  string
+	sessionID string
+	chatName  string
 	cmd       string
 	args      []string
 
@@ -47,6 +47,8 @@ type Emulator struct {
 
 	width            int
 	height           int
+	requestedWidth   int
+	requestedHeight  int
 	resizeGeneration uint64
 	resizeMu         sync.Mutex
 
@@ -54,20 +56,23 @@ type Emulator struct {
 	// panel should show the idle ASCII art icon instead of terminal output.
 	stopped bool
 
-	// cwd is the last reported working directory (via OSC 7).
-	cwd               string
-	pendingCWDChanges []string
-	pendingResponses  [][]byte
+	// cwd/title are the last validated OSC metadata from the child.
+	cwd                 WorkingDirectory
+	cwdSet              bool
+	title               string
+	pendingCWDChanges   []WorkingDirectory
+	pendingTitleChanges []string
+	pendingResponses    [][]byte
 
 	// commandHistory holds commands entered in this terminal.
 	commandHistory []string
 
 	// Callbacks run outside mu and may re-enter the Emulator.
-	// OnCWDChange and OnCommandHistoryChanged report state changes; OnError
-	// reports PTY and clipboard errors.
-	OnCWDChange             func(string)
-	OnCommandHistoryChanged func([]string)
-	OnError                 func(error)
+	onCWDChange             func(WorkingDirectory)
+	onTitleChange           func(string)
+	onCommandHistoryChanged func([]string)
+	onError                 func(error)
+	onExit                  func(PtyExitMsg)
 
 	// initialCWD is set before Start and used to chdir the PTY process.
 	initialCWD string
@@ -91,10 +96,11 @@ type Emulator struct {
 	// Drag-select state: remember the press position and whether an
 	// actual drag is in progress. Selection starts only when the mouse
 	// moves more than one cell from the press position.
-	pressX, pressY int
-	dragSelecting  bool
-	tempFiles      []string
-	readClipboard  func() (string, string, error)
+	pressX, pressY     int
+	dragSelecting      bool
+	clipboardPolicy    ClipboardTempPolicy
+	clipboardTempStore *clipboardTempStore
+	readClipboard      func(string) (string, string, error)
 
 	mu sync.RWMutex
 }
@@ -111,12 +117,15 @@ func NewEmulator(sessionID, chatName, command string, args []string) *Emulator {
 		command, args = defaultShell()
 	}
 	return &Emulator{
-		SessionID: sessionID,
-		ChatName:  chatName,
-		cmd:       command,
-		args:      append([]string(nil), args...),
-		width:     defaultTerminalCols,
-		height:    defaultTerminalRows,
+		sessionID:       sessionID,
+		chatName:        chatName,
+		cmd:             command,
+		args:            append([]string(nil), args...),
+		width:           defaultTerminalCols,
+		height:          defaultTerminalRows,
+		requestedWidth:  defaultTerminalCols,
+		requestedHeight: defaultTerminalRows,
+		clipboardPolicy: DefaultClipboardTempPolicy(),
 	}
 }
 
@@ -140,6 +149,47 @@ func (e *Emulator) StartEnv() []string {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return append([]string(nil), e.startEnv...)
+}
+
+// SessionID returns the immutable session identifier supplied at construction.
+func (e *Emulator) SessionID() string { return e.sessionID }
+
+// ChatName returns the immutable display name supplied at construction.
+func (e *Emulator) ChatName() string { return e.chatName }
+
+// SetOnCWDChange registers a callback for validated OSC 7 directory changes.
+func (e *Emulator) SetOnCWDChange(fn func(WorkingDirectory)) {
+	e.mu.Lock()
+	e.onCWDChange = fn
+	e.mu.Unlock()
+}
+
+// SetOnTitleChange registers a callback for validated OSC 0/2 terminal titles.
+func (e *Emulator) SetOnTitleChange(fn func(string)) {
+	e.mu.Lock()
+	e.onTitleChange = fn
+	e.mu.Unlock()
+}
+
+// SetOnCommandHistoryChanged registers a callback for heuristic command captures.
+func (e *Emulator) SetOnCommandHistoryChanged(fn func([]string)) {
+	e.mu.Lock()
+	e.onCommandHistoryChanged = fn
+	e.mu.Unlock()
+}
+
+// SetOnError registers a callback for PTY, clipboard, and terminal errors.
+func (e *Emulator) SetOnError(fn func(error)) {
+	e.mu.Lock()
+	e.onError = fn
+	e.mu.Unlock()
+}
+
+// SetOnExit registers a callback invoked when the child process has exited.
+func (e *Emulator) SetOnExit(fn func(PtyExitMsg)) {
+	e.mu.Lock()
+	e.onExit = fn
+	e.mu.Unlock()
 }
 
 // effectiveEnv resolves the env vars to spawn with: explicit extraEnv wins,
@@ -166,7 +216,8 @@ func (e *Emulator) SetScrollbackLimit(limit int) {
 
 // StartSync spawns the PTY process synchronously with extra environment variables.
 // Unlike StartWithEnv, it does not return a tea.Cmd — the PTY is ready immediately.
-// Returns an error if spawning fails.
+// It returns an error if spawning or initial resizing fails; a resize failure
+// leaves the spawned PTY attached with its last successfully applied size.
 func (e *Emulator) StartSync(extraEnv []string) error {
 	e.mu.Lock()
 	if e.pty != nil {
@@ -181,8 +232,8 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 	command := e.cmd
 	args := append([]string(nil), e.args...)
 	initialCWD := e.initialCWD
-	sessionID := e.SessionID
-	rows, cols := e.height, e.width
+	sessionID := e.sessionID
+	rows, cols := e.requestedHeight, e.requestedWidth
 	e.mu.Unlock()
 
 	pty, err := spawnPtyConfig(command, args, initialCWD, sessionID, rows, cols, env)
@@ -206,26 +257,18 @@ func (e *Emulator) StartSync(extraEnv []string) error {
 	e.mu.Unlock()
 
 	current, err := e.resizeAttachedPTY(pty, generation)
-	if err != nil {
-		e.mu.Lock()
-		if e.pty == pty && e.listenerGeneration == generation {
-			pty.invalidateWrites()
-			e.pty = nil
-			e.listenerGeneration++
-			e.stopped = true
-		}
-		e.mu.Unlock()
-		_ = pty.Close()
-		return fmt.Errorf("resize pty: %w", err)
-	}
 	if !current {
 		_ = pty.Close()
 		return fmt.Errorf("start cancelled")
+	}
+	if err != nil {
+		return fmt.Errorf("resize pty: %w", err)
 	}
 	return nil
 }
 
 // StartWithEnv begins spawning the PTY process with extra environment variables.
+// A non-fatal initial resize failure is reported in PtyReadyMsg.ResizeErr.
 func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
 	e.mu.Lock()
 	e.lifecycleGeneration++
@@ -241,7 +284,7 @@ func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
 		}
 		if e.pty != nil {
 			generation := e.listenerGeneration
-			sessionID := e.SessionID
+			sessionID := e.sessionID
 			e.mu.Unlock()
 			return PtyReadyMsg{SessionID: sessionID, Generation: generation, AlreadyRunning: true}
 		}
@@ -251,8 +294,8 @@ func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
 		command := e.cmd
 		args := append([]string(nil), e.args...)
 		initialCWD := e.initialCWD
-		sessionID := e.SessionID
-		rows, cols := e.height, e.width
+		sessionID := e.sessionID
+		rows, cols := e.requestedHeight, e.requestedWidth
 		e.mu.Unlock()
 
 		pty, err := spawnPtyConfig(command, args, initialCWD, sessionID, rows, cols, env)
@@ -271,47 +314,53 @@ func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd {
 		e.mu.Unlock()
 
 		current, err := e.resizeAttachedPTY(pty, generation)
-		if err != nil {
-			e.mu.Lock()
-			if e.pty == pty && e.listenerGeneration == generation {
-				pty.invalidateWrites()
-				e.pty = nil
-				e.listenerGeneration++
-			}
-			e.mu.Unlock()
-			_ = pty.Close()
-			return PtyExitMsg{SessionID: sessionID, Generation: generation, Err: fmt.Errorf("resize pty: %w", err)}
-		}
 		if !current {
 			_ = pty.Close()
 			return nil
 		}
-		return PtyReadyMsg{SessionID: sessionID, Generation: generation}
+		var resizeErr error
+		if err != nil {
+			resizeErr = fmt.Errorf("resize pty: %w", err)
+		}
+		return PtyReadyMsg{SessionID: sessionID, Generation: generation, ResizeErr: resizeErr}
 	}
 }
 
 func (e *Emulator) resetTerminalLocked() {
 	e.stopped = false
-	e.cwd = ""
+	e.cwd = WorkingDirectory{}
+	e.cwdSet = false
+	e.title = ""
 	e.pendingCWDChanges = nil
+	e.pendingTitleChanges = nil
 	e.pendingResponses = nil
 	e.listenerPending = false
 	e.listenerGeneration++
-	rows, cols := e.height, e.width
+	rows, cols := e.requestedHeight, e.requestedWidth
 	if validateTerminalSize(rows, cols) != nil {
 		rows, cols = defaultTerminalRows, defaultTerminalCols
+		e.requestedHeight, e.requestedWidth = rows, cols
 	}
+	e.height, e.width = rows, cols
 	e.screen = NewScreen(rows, cols)
 	if e.scrollbackLimitSet {
 		e.screen.SetScrollbackLimit(e.scrollbackLimit)
 	}
 	e.parser = NewParser(e.screen)
-	e.parser.SetCWDCallback(func(path string) {
-		if path == e.cwd {
+	e.parser.SetCWDCallback(func(cwd WorkingDirectory) {
+		if e.cwdSet && cwd == e.cwd {
 			return
 		}
-		e.cwd = path
-		e.pendingCWDChanges = append(e.pendingCWDChanges, path)
+		e.cwd = cwd
+		e.cwdSet = true
+		e.pendingCWDChanges = append(e.pendingCWDChanges, cwd)
+	})
+	e.parser.SetTitleCallback(func(title string) {
+		if title == e.title {
+			return
+		}
+		e.title = title
+		e.pendingTitleChanges = append(e.pendingTitleChanges, title)
 	})
 	e.parser.SetResponseCallback(func(data []byte) {
 		e.pendingResponses = append(e.pendingResponses, append([]byte(nil), data...))
@@ -359,12 +408,15 @@ func (e *Emulator) Listen() tea.Cmd {
 	e.mu.Unlock()
 
 	return func() tea.Msg {
-		msg := pty.Listen(e.SessionID)()
+		msg := pty.Listen(e.sessionID)()
 		switch m := msg.(type) {
 		case PtyOutputMsg:
 			m.Generation = generation
 			msg = m
 		case PtyExitMsg:
+			m.Generation = generation
+			msg = m
+		case PtyWarningMsg:
 			m.Generation = generation
 			msg = m
 		}
@@ -399,11 +451,15 @@ func defaultShell() (string, []string) {
 	return DefaultShell()
 }
 
-// Pty returns the underlying PTY for debug purposes.
-func (e *Emulator) Pty() *Pty {
+// PtyState returns an immutable snapshot of the attached PTY.
+func (e *Emulator) PtyState() PtyState {
 	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.pty
+	pty := e.pty
+	e.mu.RUnlock()
+	if pty == nil {
+		return PtyState{}
+	}
+	return pty.State()
 }
 
 // View renders the terminal screen at the given panel size. The screen size is
@@ -437,9 +493,13 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 	case PtyReadyMsg:
 		e.mu.RLock()
 		generation := e.listenerGeneration
+		onError := e.onError
 		e.mu.RUnlock()
-		if msg.SessionID != e.SessionID || msg.Generation != generation || msg.AlreadyRunning {
+		if msg.SessionID != e.sessionID || msg.Generation != generation || msg.AlreadyRunning {
 			return nil
+		}
+		if msg.ResizeErr != nil && onError != nil {
+			onError(msg.ResizeErr)
 		}
 		return e.Listen()
 	case tea.FocusMsg:
@@ -450,13 +510,13 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		e.mu.Lock()
 		if e.screen != nil {
 			e.screen.markDirty()
-			e.screen.CursorBlinkVisible = !e.screen.CursorBlinkVisible
+			e.screen.cursorBlinkVisible = !e.screen.cursorBlinkVisible
 		}
 		e.mu.Unlock()
 		return nil
 	case PtyOutputMsg:
 		e.mu.Lock()
-		if msg.SessionID != e.SessionID || msg.Generation != e.listenerGeneration {
+		if msg.SessionID != e.sessionID || msg.Generation != e.listenerGeneration {
 			e.mu.Unlock()
 			return nil
 		}
@@ -467,17 +527,25 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 			// terminal instance.
 			parser.Feed(msg.Data)
 		}
-		cwdChanges := append([]string(nil), e.pendingCWDChanges...)
+		cwdChanges := append([]WorkingDirectory(nil), e.pendingCWDChanges...)
 		e.pendingCWDChanges = nil
+		titleChanges := append([]string(nil), e.pendingTitleChanges...)
+		e.pendingTitleChanges = nil
 		responses := append([][]byte(nil), e.pendingResponses...)
 		e.pendingResponses = nil
-		onCWDChange := e.OnCWDChange
+		onCWDChange := e.onCWDChange
+		onTitleChange := e.onTitleChange
 		pty := e.pty
 		generation := e.listenerGeneration
 		e.mu.Unlock()
 		if onCWDChange != nil {
-			for _, path := range cwdChanges {
-				onCWDChange(path)
+			for _, cwd := range cwdChanges {
+				onCWDChange(cwd)
+			}
+		}
+		if onTitleChange != nil {
+			for _, title := range titleChanges {
+				onTitleChange(title)
 			}
 		}
 		listen := e.Listen()
@@ -486,8 +554,8 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		}
 		reply := func() tea.Msg {
 			for _, data := range responses {
-				if err := pty.WriteForGeneration(generation, data); err != nil {
-					return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
+				if err := pty.writeForGeneration(generation, data); err != nil {
+					return PtyExitMsg{SessionID: e.sessionID, Generation: generation, Err: err}
 				}
 			}
 			return nil
@@ -502,7 +570,7 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		return nil
 	case PtyExitMsg:
 		e.mu.Lock()
-		if msg.SessionID != e.SessionID || msg.Generation != e.listenerGeneration {
+		if msg.SessionID != e.sessionID || msg.Generation != e.listenerGeneration {
 			e.mu.Unlock()
 			return nil
 		}
@@ -510,23 +578,46 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		if pty != nil {
 			pty.invalidateWrites()
 		}
+		clipboardStore := e.clipboardTempStore
+		e.clipboardTempStore = nil
 		e.pty = nil
 		e.listenerPending = false
 		e.listenerGeneration++
 		e.lifecycleGeneration++
 		e.stopped = true
-		onError := e.OnError
+		onError := e.onError
+		onExit := e.onExit
 		e.mu.Unlock()
 		if pty != nil {
 			_ = pty.Close()
+		}
+		if clipboardStore != nil {
+			if err := clipboardStore.close(); err != nil && onError != nil {
+				onError(err)
+			}
+		}
+		if msg.ProcessExited && onExit != nil {
+			onExit(msg)
 		}
 		if msg.Err != nil && onError != nil {
 			onError(msg.Err)
 		}
 		return nil
+	case PtyWarningMsg:
+		e.mu.RLock()
+		current := msg.SessionID == e.sessionID && msg.Generation == e.listenerGeneration
+		onError := e.onError
+		e.mu.RUnlock()
+		if !current {
+			return nil
+		}
+		if msg.Err != nil && onError != nil {
+			onError(msg.Err)
+		}
+		return e.Listen()
 	case ClipboardErrorMsg:
 		e.mu.RLock()
-		onError := e.OnError
+		onError := e.onError
 		e.mu.RUnlock()
 		if msg.Err != nil && onError != nil {
 			onError(msg.Err)
@@ -534,7 +625,7 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd {
 		return nil
 	case PtyErrorMsg:
 		e.mu.RLock()
-		onError := e.OnError
+		onError := e.onError
 		e.mu.RUnlock()
 		if msg.Err != nil && onError != nil {
 			onError(msg.Err)
@@ -570,7 +661,7 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 	// Capture the command line before sending Enter to the PTY.
 	historyChanged := false
 	if msg.Type == tea.KeyEnter && e.screen != nil {
-		line := e.screen.LineText(e.screen.Cursor.Row)
+		line := e.screen.LineText(e.screen.cursor.Row)
 		cmd := stripPrompt(line)
 		if cmd != "" && (len(e.commandHistory) == 0 || e.commandHistory[len(e.commandHistory)-1] != cmd) {
 			e.commandHistory = append(e.commandHistory, cmd)
@@ -583,7 +674,7 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 
 	// Copy callback state while locked, but never invoke external code under
 	// the emulator mutex: callbacks may safely call back into Emulator.
-	onHistoryChanged := e.OnCommandHistoryChanged
+	onHistoryChanged := e.onCommandHistoryChanged
 	history := append([]string(nil), e.commandHistory...)
 	pty := e.pty
 	generation := e.listenerGeneration
@@ -593,13 +684,30 @@ func (e *Emulator) handleKey(msg tea.KeyMsg) tea.Cmd {
 		onHistoryChanged(history)
 	}
 
-	// Queue synchronously to preserve keystroke order before returning to Bubble Tea.
-	if err := pty.WriteForGeneration(generation, data); err != nil {
-		return func() tea.Msg {
-			return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
+	return queueInteractivePtyWrite(pty, e.sessionID, generation, data)
+}
+
+func queueInteractivePtyWrite(pty *Pty, sessionID string, generation uint64, data []byte) tea.Cmd {
+	result, err := pty.enqueueInteractiveWrite(generation, data)
+	if err != nil {
+		if err == errPtyClosed || err == errStalePtyWrite {
+			return nil
 		}
+		return func() tea.Msg { return PtyErrorMsg{Err: err} }
 	}
-	return nil
+	if result == nil {
+		return nil
+	}
+	return func() tea.Msg {
+		select {
+		case err := <-result:
+			if err != nil && err != errPtyClosed && err != errStalePtyWrite {
+				return PtyExitMsg{SessionID: sessionID, Generation: generation, Err: err}
+			}
+		case <-pty.done:
+		}
+		return nil
+	}
 }
 
 // stripPrompt removes the shell prompt prefix from a terminal line.
@@ -673,12 +781,7 @@ func (e *Emulator) handleMouse(msg tea.MouseMsg) tea.Cmd {
 		if len(data) == 0 {
 			return nil
 		}
-		if err := pty.WriteForGeneration(generation, data); err != nil {
-			return func() tea.Msg {
-				return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
-			}
-		}
-		return nil
+		return queueInteractivePtyWrite(pty, e.sessionID, generation, data)
 	}
 
 	if screen == nil {
@@ -827,28 +930,48 @@ func (e *Emulator) handlePanelResize(msg ResizeMsg) tea.Cmd {
 		return nil
 	}
 	e.mu.Lock()
-	if err := e.updateTerminalSizeLocked(msg.Height, msg.Width); err != nil {
+	if err := e.requestTerminalSizeLocked(msg.Height, msg.Width); err != nil {
 		e.mu.Unlock()
 		return nil
 	}
 	pty := e.pty
 	generation := e.listenerGeneration
-	e.mu.Unlock()
-	if pty != nil {
-		current, err := e.resizeAttachedPTY(pty, generation)
-		if err != nil {
-			return func() tea.Msg {
-				return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
-			}
-		}
-		if !current {
+	if pty == nil {
+		if err := e.applyTerminalSizeLocked(msg.Height, msg.Width); err != nil {
+			e.mu.Unlock()
 			return nil
 		}
+		e.mu.Unlock()
+		return nil
+	}
+	e.mu.Unlock()
+
+	current, err := e.resizeAttachedPTY(pty, generation)
+	if err != nil {
+		return func() tea.Msg {
+			return PtyWarningMsg{SessionID: e.sessionID, Generation: generation, Err: fmt.Errorf("resize pty: %w", err)}
+		}
+	}
+	if !current {
+		return nil
 	}
 	return nil
 }
 
-func (e *Emulator) updateTerminalSizeLocked(rows, cols int) error {
+func (e *Emulator) requestTerminalSizeLocked(rows, cols int) error {
+	if err := validateTerminalSize(rows, cols); err != nil {
+		return err
+	}
+	if e.requestedHeight == rows && e.requestedWidth == cols {
+		return nil
+	}
+	e.requestedHeight = rows
+	e.requestedWidth = cols
+	e.resizeGeneration++
+	return nil
+}
+
+func (e *Emulator) applyTerminalSizeLocked(rows, cols int) error {
 	if err := validateTerminalSize(rows, cols); err != nil {
 		return err
 	}
@@ -862,7 +985,6 @@ func (e *Emulator) updateTerminalSizeLocked(rows, cols int) error {
 	}
 	e.height = rows
 	e.width = cols
-	e.resizeGeneration++
 	return nil
 }
 
@@ -876,7 +998,7 @@ func (e *Emulator) resizeAttachedPTY(pty *Pty, generation uint64) (bool, error) 
 			e.mu.RUnlock()
 			return false, nil
 		}
-		rows, cols := e.height, e.width
+		rows, cols := e.requestedHeight, e.requestedWidth
 		resizeGeneration := e.resizeGeneration
 		e.mu.RUnlock()
 
@@ -884,16 +1006,30 @@ func (e *Emulator) resizeAttachedPTY(pty *Pty, generation uint64) (bool, error) 
 			return true, err
 		}
 		if err := pty.Resize(rows, cols); err != nil {
+			e.mu.RLock()
+			current := e.pty == pty && e.listenerGeneration == generation
+			changed := e.resizeGeneration != resizeGeneration
+			e.mu.RUnlock()
+			if !current {
+				return false, nil
+			}
+			if changed {
+				continue
+			}
 			return true, err
 		}
 
-		e.mu.RLock()
-		current := e.pty == pty && e.listenerGeneration == generation
-		changed := e.resizeGeneration != resizeGeneration
-		e.mu.RUnlock()
-		if !current {
+		e.mu.Lock()
+		if e.pty != pty || e.listenerGeneration != generation {
+			e.mu.Unlock()
 			return false, nil
 		}
+		if err := e.applyTerminalSizeLocked(rows, cols); err != nil {
+			e.mu.Unlock()
+			return true, err
+		}
+		changed := e.resizeGeneration != resizeGeneration
+		e.mu.Unlock()
 		if !changed {
 			return true, nil
 		}
@@ -915,8 +1051,8 @@ func (e *Emulator) focusChanged(focused bool) tea.Cmd {
 		data = []byte("\x1b[I")
 	}
 	return func() tea.Msg {
-		if err := pty.WriteForGeneration(generation, data); err != nil {
-			return PtyExitMsg{SessionID: e.SessionID, Generation: generation, Err: err}
+		if err := pty.writeForGeneration(generation, data); err != nil {
+			return PtyExitMsg{SessionID: e.sessionID, Generation: generation, Err: err}
 		}
 		return nil
 	}
@@ -934,15 +1070,15 @@ func (e *Emulator) Blur() tea.Cmd {
 	return e.focusChanged(false)
 }
 
-// Close closes the PTY.
+// Close closes the PTY and removes this Emulator's private clipboard files.
 func (e *Emulator) Close() error {
 	e.mu.Lock()
 	pty := e.pty
 	if pty != nil {
 		pty.invalidateWrites()
 	}
-	tempFiles := append([]string(nil), e.tempFiles...)
-	e.tempFiles = nil
+	clipboardStore := e.clipboardTempStore
+	e.clipboardTempStore = nil
 	e.pty = nil
 	e.listenerPending = false
 	e.listenerGeneration++
@@ -952,23 +1088,23 @@ func (e *Emulator) Close() error {
 	if pty != nil {
 		closeErr = pty.Close()
 	}
-	for _, path := range tempFiles {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && closeErr == nil {
+	if clipboardStore != nil {
+		if err := clipboardStore.close(); err != nil && closeErr == nil {
 			closeErr = err
 		}
 	}
 	return closeErr
 }
 
-// Stop terminates the session and switches the panel to the idle ASCII art view.
+// Stop terminates the session, removes clipboard files, and shows the idle view.
 func (e *Emulator) Stop() error {
 	e.mu.Lock()
 	pty := e.pty
 	if pty != nil {
 		pty.invalidateWrites()
 	}
-	tempFiles := append([]string(nil), e.tempFiles...)
-	e.tempFiles = nil
+	clipboardStore := e.clipboardTempStore
+	e.clipboardTempStore = nil
 	e.pty = nil
 	e.listenerPending = false
 	e.listenerGeneration++
@@ -979,8 +1115,8 @@ func (e *Emulator) Stop() error {
 	if pty != nil {
 		closeErr = pty.Close()
 	}
-	for _, path := range tempFiles {
-		if err := os.Remove(path); err != nil && !os.IsNotExist(err) && closeErr == nil {
+	if clipboardStore != nil {
+		if err := clipboardStore.close(); err != nil && closeErr == nil {
 			closeErr = err
 		}
 	}
@@ -994,19 +1130,47 @@ func (e *Emulator) SetInitialCWD(dir string) {
 	e.initialCWD = dir
 }
 
-// CWD returns the current working directory of the PTY process.
-// Falls back to InitialCWD if the PTY hasn't reported OSC 7 yet.
-func (e *Emulator) CWD() string {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	if e.cwd != "" {
-		return e.cwd
+// CurrentWorkingDirectory returns the last OSC 7 location, falling back to the
+// configured initial directory. The boolean is false when neither is known.
+func (e *Emulator) CurrentWorkingDirectory() (WorkingDirectory, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if e.cwdSet {
+		return e.cwd, true
 	}
-	return e.initialCWD
+	if e.initialCWD != "" {
+		return WorkingDirectory{Path: e.initialCWD, Local: true}, true
+	}
+	return WorkingDirectory{}, false
 }
 
-// SetCommandHistory restores a previously saved command history, keeping only
-// the newest maxCommandHistory entries.
+// CWD returns the directory path without authority metadata.
+// Use CurrentWorkingDirectory to distinguish local and remote locations.
+func (e *Emulator) CWD() string {
+	cwd, ok := e.CurrentWorkingDirectory()
+	if !ok {
+		return ""
+	}
+	return cwd.Path
+}
+
+// Title returns the last validated terminal title reported through OSC 0/2.
+func (e *Emulator) Title() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.title
+}
+
+// CommandHistorySnapshot returns a copy of the command list. New captures are
+// heuristically scraped from the visible prompt line, not read from shell history.
+func (e *Emulator) CommandHistorySnapshot() []string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return append([]string(nil), e.commandHistory...)
+}
+
+// SetCommandHistory restores a previously saved heuristic command list, keeping
+// only the newest maxCommandHistory entries.
 func (e *Emulator) SetCommandHistory(history []string) {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -1221,9 +1385,11 @@ func tildeKeySequence(code, modifier int) []byte {
 // terminal emulators so their cursors blink in sync.
 type CursorBlinkMsg struct{}
 
-// PtyReadyMsg is sent when the PTY is ready for listening.
+// PtyReadyMsg is sent when the PTY is ready for listening. ResizeErr is a
+// non-fatal error applying a requested PTY size after the process started.
 type PtyReadyMsg struct {
 	SessionID      string
 	Generation     uint64
 	AlreadyRunning bool
+	ResizeErr      error
 }

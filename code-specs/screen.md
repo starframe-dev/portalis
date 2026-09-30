@@ -62,39 +62,7 @@ type Cursor struct {
 
 ### `Screen`
 
-```go
-type Screen struct {
-    Rows   int          // Высота экрана (количество строк)
-    Cols   int          // Ширина экрана (количество столбцов)
-    Cells  [][]Cell     // Двумерная сетка ячеек
-
-    Cursor Cursor       // Текущая позиция курсора
-
-    savedCursor Cursor        // Сохранённый курсор (ESC 7/8)
-    savedCells   [][]Cell      // Содержимое при входе в альтернативный экран
-
-    scrollTop, scrollBottom int   // Границы области прокрутки (DECSTBM, 0-indexed)
-    scrollback      [][]Cell   // Выведенные за пределы области строки
-    scrollbackCells int        // Число ячеек в scrollback
-    scrollbackLimit int        // Лимит строк scrollback (по умолчанию 10000)
-    viewOffset      int        // Смещение просмотра (сколько строк вверх от live-экрана)
-
-    wrapPending bool  // true после записи в последнюю колонку; следующая буква оборачивает
-
-    syncActive bool    // true во время синхронизированного вывода
-    lastRender string   // Последний закоммиченный кадр
-    renderDirty bool    // true если lastRender устарел
-
-    applicationCursor bool // ?1h
-    bracketedPaste    bool // ?2004h
-    CursorVisible     bool // ?25h
-    CursorBlinkVisible bool  // Курсор мигает (для эмулятора)
-
-    selStartRow, selStartCol int  // Начало выделения
-    selEndRow, selEndCol     int   // Конец выделения
-    selectionActive          bool // Активно ли выделение
-}
-```
+Все поля состояния `Screen` приватны. Размеры, cursor и cell state доступны только через безопасные getters и копии; изменение выполняется методами `Screen`.
 
 ## Публичный API
 
@@ -110,6 +78,8 @@ if err := s.ResizeChecked(40, 120); err != nil {
     return err
 }
 ```
+
+`Rows()` и `Cols()` читают размеры; `CellAt(row, col)` возвращает копию одной ячейки, `CellsSnapshot()` — глубокую копию видимой сетки, `CursorState()` — значение cursor state. Изменение snapshots не меняет внутренний `Screen`.
 
 #### `SetScrollbackLimit(limit int)`
 
@@ -214,6 +184,14 @@ if err := s.ResizeChecked(40, 120); err != nil {
 #### `InsertLines(n int)` / `DeleteLines(n int)`
 
 Вставляют/удаляют строки внутри активной области прокрутки.
+
+#### Insert mode и tab stops
+
+`SetInsertMode(bool)` включает сдвиг существующих ячеек при записи текста. `SetTabStop()` ставит stop в текущей колонке; `ClearTabStop(0)` очищает текущую, `ClearTabStop(3)` — все. `TabForward`/`TabBackward` используют настроенные stops (по умолчанию каждые 8 колонок).
+
+#### `Reset()` и `SoftReset()`
+
+`Reset()` восстанавливает power-on screen state без изменения размеров и настроенного scrollback limit. `SoftReset()` сбрасывает режимы и rendition/cursor state, но сохраняет текст основного экрана.
 
 ### Альтернативный экран (ANSI SGR)
 
@@ -422,7 +400,7 @@ s.SetSync(false) // восстановление последнего кадра
 - При vertical shrink cursor-aware верхние строки добавляются в primary scrollback один раз, нижние строки сохраняются; активный и saved buffer вычисляют top-trim независимо.
 - Перед wrap `Put` проверяет, продолжает ли rune предыдущий grapheme; wide glyph, расширяющийся у правого края, перемещается целиком.
 - Keycap sequence с U+20E3 имеет display width 2, даже если общая Unicode width library сообщает 1.
-- Размер одного grapheme cluster ограничен \`maxGraphemeBytes\` (4096 байт), чтобы combining/ZWJ flood не создавал неограниченное потребление памяти.
+- Payload одного grapheme cluster ограничен \`maxGraphemeBytes\` (64 байта). При лимитах сетки/scrollback и одновременных primary/alternate buffers worst-case суммарный grapheme payload около 96 MiB; это не включает per-cell/runtime overhead.
 - Scrollback ограничен 1048576 ячейками; при уменьшении line limit \`viewOffset\` clamp-ится к новому размеру.
 - Mouse state хранит DEC modes 1000/1002/1003 и SGR flag 1006; Emulator использует их для маршрутизации событий.
 

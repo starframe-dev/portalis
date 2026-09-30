@@ -24,16 +24,24 @@ func NewParser(screen *Screen) *Parser
 
 ## Методы
 
-### SetCWDCallback
+### SetCWDCallback и SetTitleCallback
 
 ```go
-func (p *Parser) SetCWDCallback(fn func(string))
+func (p *Parser) SetCWDCallback(fn func(WorkingDirectory))
+func (p *Parser) SetTitleCallback(fn func(string))
 ```
 
-Устанавливает callback, который `Feed` вызывает синхронно при изменении рабочей директории. Он должен быстро завершиться и не вызывать повторно `Feed`.
+Callbacks OSC 7 и OSC 0/2 вызываются синхронно внутри `Feed`. Они должны быстро завершаться и не вызывать повторно `Feed`.
 
-**Параметры:**
-- `fn` — функция, принимающая путь к рабочей директории
+```go
+type WorkingDirectory struct {
+    Host  string
+    Path  string
+    Local bool
+}
+```
+
+Для `file://host/path` сохраняется host; `Local` показывает, относится ли путь к этой машине.
 
 ---
 
@@ -67,8 +75,10 @@ type Parser struct {
     state     ansiState
     buf       strings.Builder
     utf8Buf   []byte
-    onCWD     func(string)
-    lastCWD   string
+    onCWD     func(WorkingDirectory)
+    onTitle   func(string)
+    lastCWD   WorkingDirectory
+    lastTitle string
 }
 ```
 
@@ -139,17 +149,7 @@ func parseParams(s string) []int
 func extractOSC7Path(s string) string
 ```
 
-Извлекает абсолютный путь файловой системы из OSC 7 payload.
-
-**Поддерживаемые формы:**
-- `file://hostname/path` → percent-decoded `/path`
-- `/absolute/path` → `/absolute/path`
-
-**Параметры:**
-- `s` — OSC payload
-
-**Возвращает:**
-- Абсолютный путь или пустая строка
+Внутренний `extractOSC7Path` возвращает только локальный путь для legacy package tests. Основной parser использует `parseOSC7WorkingDirectory`, который сохраняет host и различает local/remote URI. Публичный API передаёт `WorkingDirectory` через callback; не полагайтесь на внутренний helper.
 
 ---
 
@@ -396,7 +396,11 @@ OSC 7 ;file://hostname/path BEL
 OSC 7 ;/absolute/path BEL
 ```
 
-При обработке вызывается `SetCWDCallback`, если путь отличается от `lastCWD`.
+При обработке вызывается `SetCWDCallback`, если структурированное значение отличается от `lastCWD`. Локальные абсолютные пути принимаются; `file://host/path` сохраняет remote host и выдаёт `Local=false`. Userinfo, port, query/fragment, относительные пути и управляющие символы отклоняются.
+
+### OSC 0/2 — заголовок
+
+`OSC 0;title` и `OSC 2;title`, завершённые BEL или ST, вызывают `SetTitleCallback` при изменении валидированного заголовка. Пустые, превышающие 4096 байт или содержащие управляющие символы заголовки игнорируются.
 
 ---
 
@@ -435,7 +439,7 @@ CSI-последовательности и продолжает обычный 
 
 ## Управляющий символ табуляции
 
-`\t` — перемещает курсор в следующее позиционированное поле (кратное 8).
+`\t` — перемещает курсор к следующему tab stop. Stops по умолчанию установлены через каждые 8 колонок; `ESC H` устанавливает stop, `CSI 0 g` очищает текущий, `CSI 3 g` очищает все. `CSI Z` выполняет обратную табуляцию.
 
 ---
 
@@ -476,7 +480,7 @@ CSI-последовательности и продолжает обычный 
 - CSI buffer ограничен 4096 байт; malformed/unterminated CSI не может расти бесконечно.
 - OSC buffer ограничен 64 KiB.
 - Invalid UTF-8 восстанавливается через replacement rune без накопления неограниченного \`utf8Buf\`.
-- OSC 7 path percent-decode'ится как URL path; принимаются hostless, loopback, `localhost` и hostname текущего компьютера. Remote host, userinfo, port, query/fragment и NUL/BEL/ESC/CR/LF отклоняются.
+- OSC 7 path percent-decode'ится как URL path; local и remote file URLs сохраняют host/local metadata. Userinfo, port, query/fragment, относительные пути и NUL/BEL/ESC/CR/LF отклоняются.
 - 256-color cube соответствует xterm, а RGB компоненты clamp'ятся к 0…255.
 
 
@@ -490,7 +494,13 @@ Parser принимает callback ответов через \`SetResponseCallba
 - \`CSI 5 n\` → \`CSI 0 n\`;
 - \`CSI 6 n\` → фактический \`CSI row;col R\`;
 - \`CSI c\` → primary device attributes;
-- \`CSI > c\` → secondary device attributes.
+- \`CSI > c\` → generic secondary device attributes (`CSI > 0;0;0 c`), без xterm-version claim.
+
+## Совместимость terminfo `ansi`
+
+По умолчанию дочерний процесс получает `TERM=ansi`, который `infocmp` описывает как 8-color профиль. Реализованы используемые им базовые cursor addressing, HPA/VPA, insert/delete/erase, scrolling, tab stop controls (`ESC H`, `CSI I/Z`, `CSI g`), `REP`, SGR, G0/G1 charset и DSR/DA ответы. Парсер также принимает 16/256/24-bit SGR colors, хотя этот TERM профиль обещает приложению только 8 цветов.
+
+Полная terminfo запись `ansi` включает неподдерживаемые printer controls `mc4/mc5` и G2/G3 charset designators (`s2ds/s3ds`); Portalis не является универсальной ANSI/VT эмуляцией. Не выбирайте более широкий TERM, если host не предоставляет согласованную terminfo запись.
 
 ## Строковые управляющие последовательности
 
@@ -504,6 +514,8 @@ Parser принимает callback ответов через \`SetResponseCallba
 - ED2 очищает экран без перемещения курсора.
 - ED1 и ED3 поддерживаются; ED3 очищает scrollback.
 - DECSC/DECRC сохраняют позицию, SGR, origin/autowrap modes и активные G0/G1 charsets.
-- `?1049` сохраняет и восстанавливает G0/G1 charset вместе с alternate screen.
+- `?1047` переключает alternate buffer, `?1048` сохраняет/восстанавливает cursor, `?1049` сочетает alternate buffer и cursor save; G0/G1 charset восстанавливается при выходе.
+- `CSI 4 h/l` переключает insert mode; `ESC c` выполняет RIS, `CSI ! p` — DECSTR без очистки основного текста.
+- DA1 отвечает `CSI ? 1;2 c`; DA2 отвечает нейтральным `CSI > 0;0;0 c`, не заявляя конкретную версию xterm.
 - CUP/HVP/VPA учитывают DECOM и активный scroll region.
 - BCE применяется к ячейкам, создаваемым erase/insert/delete/scroll.

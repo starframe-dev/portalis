@@ -7,6 +7,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"sync"
 	"syscall"
 
@@ -15,7 +16,7 @@ import (
 )
 
 func openPrivateRawTrace(path string) (*os.File, error) {
-	trace, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	trace, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -26,17 +27,54 @@ func openPrivateRawTrace(path string) (*os.File, error) {
 	return trace, nil
 }
 
-// Pty wraps a pseudoterminal and forwards output to channels. Methods are
-// safe for concurrent use; consume output through Listen or the exported
-// channels, but not both, and call Listen at most once per Pty.
+func (p *Pty) reportWarning(err error) {
+	if p == nil || err == nil || p.warnings == nil {
+		return
+	}
+	select {
+	case p.warnings <- err:
+	default:
+	}
+}
+
+func (p *Pty) writeTrace(trace *io.WriteCloser, data []byte, label string) {
+	if trace == nil || *trace == nil {
+		return
+	}
+	written, err := (*trace).Write(data)
+	if err == nil && written != len(data) {
+		err = io.ErrShortWrite
+	}
+	if err == nil {
+		return
+	}
+	p.reportWarning(fmt.Errorf("write %s: %w", label, err))
+	closeErr := (*trace).Close()
+	*trace = nil
+	if closeErr != nil {
+		p.reportWarning(fmt.Errorf("close %s: %w", label, closeErr))
+	}
+}
+
+// PtyState describes the observable lifecycle and size of a PTY.
+type PtyState struct {
+	Running bool
+	PID     int
+	Rows    int
+	Cols    int
+}
+
+// Pty wraps a pseudoterminal. Methods are safe for concurrent use; consume
+// output through Listen and call it at most once per active output chain.
 type Pty struct {
 	cmd             *exec.Cmd
 	ptmx            *os.File
 	reader          *bufio.Reader
 	rawTrace        io.WriteCloser
 	rawTraceChunks  io.WriteCloser
-	Output          chan []byte
-	Errors          chan error
+	output          chan []byte
+	errors          chan error
+	warnings        chan error
 	done            chan struct{}
 	readDone        chan struct{}
 	writeQueue      chan ptyWrite
@@ -61,26 +99,32 @@ type Pty struct {
 }
 
 type ptyWrite struct {
-	generation uint64
-	data       []byte
-	result     chan error
+	generation  uint64
+	data        []byte
+	interactive bool
+	result      chan error
 }
 
 const (
-	ptyWriteQueueCapacity  = 64
-	maxPtyQueuedWriteBytes = 100 << 20
+	ptyWriteQueueCapacity       = 64
+	maxPtyQueuedWriteBytes      = 100 << 20
+	maxPtyInteractiveWriteBytes = 64 << 10
 )
 
 var (
-	errPtyClosed             = errors.New("pty closed")
-	errStalePtyWrite         = errors.New("stale pty write generation")
-	errPtyWriteExceedsBudget = errors.New("pty write exceeds queue byte limit")
+	errPtyClosed                        = errors.New("pty closed")
+	errStalePtyWrite                    = errors.New("stale pty write generation")
+	errPtyWriteExceedsBudget            = errors.New("pty write exceeds queue byte limit")
+	errPtyInteractiveWriteExceedsBudget = errors.New("interactive pty write exceeds reserved byte limit")
+	errPtyWriteQueueFull                = errors.New("pty writer queue is full")
+	errPtyWriterUnavailable             = errors.New("pty writer queue unavailable")
 )
 
 type ptyWriteBudget struct {
-	mu      sync.Mutex
-	used    int
-	changed chan struct{}
+	mu              sync.Mutex
+	used            int
+	interactiveUsed int
+	changed         chan struct{}
 }
 
 func newPtyWriteBudget() ptyWriteBudget {
@@ -106,9 +150,26 @@ func (b *ptyWriteBudget) acquire(size int, done <-chan struct{}) bool {
 	}
 }
 
-func (b *ptyWriteBudget) release(size int) {
+func (b *ptyWriteBudget) tryAcquireInteractive(size int) bool {
+	if size < 0 || size > maxPtyInteractiveWriteBytes {
+		return false
+	}
 	b.mu.Lock()
-	b.used -= size
+	defer b.mu.Unlock()
+	if b.interactiveUsed+size > maxPtyInteractiveWriteBytes {
+		return false
+	}
+	b.interactiveUsed += size
+	return true
+}
+
+func (b *ptyWriteBudget) release(size int, interactive bool) {
+	b.mu.Lock()
+	if interactive {
+		b.interactiveUsed -= size
+	} else {
+		b.used -= size
+	}
 	close(b.changed)
 	b.changed = make(chan struct{})
 	b.mu.Unlock()
@@ -129,7 +190,7 @@ func spawnPtyWithSize(command string, args []string, dir string, rows, cols int,
 		return nil, fmt.Errorf("invalid initial pty size %dx%d: %w", rows, cols, err)
 	}
 	cmd := exec.Command(command, args...)
-	cmd.Env = append(os.Environ(), "TERM=xterm-256color")
+	cmd.Env = append(os.Environ(), "TERM=ansi")
 	cmd.Env = append(cmd.Env, env...)
 	if dir != "" {
 		cmd.Dir = dir
@@ -143,8 +204,9 @@ func spawnPtyWithSize(command string, args []string, dir string, rows, cols int,
 		cmd:         cmd,
 		ptmx:        ptmx,
 		reader:      bufio.NewReader(ptmx),
-		Output:      make(chan []byte, 64),
-		Errors:      make(chan error, 1),
+		output:      make(chan []byte, 64),
+		errors:      make(chan error, 1),
+		warnings:    make(chan error, 8),
 		done:        make(chan struct{}),
 		readDone:    make(chan struct{}),
 		writeQueue:  make(chan ptyWrite, ptyWriteQueueCapacity),
@@ -154,12 +216,22 @@ func spawnPtyWithSize(command string, args []string, dir string, rows, cols int,
 		lastCols:    cols,
 	}
 	if traceBase := os.Getenv("PORTALIS_RAW_TRACE"); traceBase != "" {
+		config, configWarnings := rawTraceConfigFromEnv()
+		for _, warning := range configWarnings {
+			p.reportWarning(warning)
+		}
 		tracePath := fmt.Sprintf("%s.%d", traceBase, cmd.Process.Pid)
-		if trace, traceErr := openPrivateRawTrace(tracePath); traceErr == nil {
+		trace, traceErr := openRotatingTrace(tracePath, config)
+		if traceErr != nil {
+			p.reportWarning(fmt.Errorf("open raw PTY trace: %w", traceErr))
+		} else {
 			p.rawTrace = trace
-			if chunks, chunksErr := openPrivateRawTrace(tracePath + ".chunks"); chunksErr == nil {
-				p.rawTraceChunks = chunks
-			}
+		}
+		chunks, chunksErr := openRotatingTrace(tracePath+".chunks", config)
+		if chunksErr != nil {
+			p.reportWarning(fmt.Errorf("open PTY trace chunk index: %w", chunksErr))
+		} else {
+			p.rawTraceChunks = chunks
 		}
 	}
 
@@ -176,12 +248,12 @@ func (p *Pty) Write(data []byte) error {
 	p.mu.Lock()
 	generation := p.writeGeneration
 	p.mu.Unlock()
-	return p.WriteForGeneration(generation, data)
+	return p.writeForGeneration(generation, data)
 }
 
-// WriteForGeneration enqueues data only while generation is current. One
+// writeForGeneration enqueues data only while generation is current. One
 // writer goroutine performs all queued writes in admission order.
-func (p *Pty) WriteForGeneration(generation uint64, data []byte) error {
+func (p *Pty) writeForGeneration(generation uint64, data []byte) error {
 	if p == nil {
 		return errPtyClosed
 	}
@@ -208,11 +280,84 @@ func (p *Pty) WriteForGeneration(generation uint64, data []byte) error {
 }
 
 func (p *Pty) enqueueWrite(generation uint64, data []byte) (<-chan error, error) {
+	if !p.writeBudget.acquire(len(data), p.done) {
+		return nil, errPtyClosed
+	}
+	request := ptyWrite{
+		generation: generation,
+		data:       append([]byte(nil), data...),
+		result:     make(chan error, 1),
+	}
+	return p.enqueueReservedWrite(request)
+}
+
+// enqueueInteractiveWrite never waits for byte budget, the queue lock, or a
+// queue slot. UI callers can report backpressure without blocking the update loop.
+func (p *Pty) enqueueInteractiveWrite(generation uint64, data []byte) (<-chan error, error) {
+	if p == nil {
+		return nil, errPtyClosed
+	}
+	if len(data) == 0 {
+		return nil, nil
+	}
+	if p.writeQueue == nil {
+		return nil, errPtyWriterUnavailable
+	}
+	if len(data) > maxPtyInteractiveWriteBytes {
+		return nil, errPtyInteractiveWriteExceedsBudget
+	}
+	if !p.writeBudget.tryAcquireInteractive(len(data)) {
+		return nil, errPtyWriteQueueFull
+	}
+	request := ptyWrite{
+		generation:  generation,
+		data:        append([]byte(nil), data...),
+		interactive: true,
+		result:      make(chan error, 1),
+	}
+	if !p.writeEnqueueMu.TryLock() {
+		p.writeBudget.release(len(data), true)
+		return nil, errPtyWriteQueueFull
+	}
+	defer p.writeEnqueueMu.Unlock()
+
+	select {
+	case <-p.done:
+		p.writeBudget.release(len(data), true)
+		return nil, errPtyClosed
+	default:
+	}
+	p.mu.Lock()
+	open := p.ptmx != nil && !p.writeClosed
+	currentGeneration := p.writeGeneration
+	p.mu.Unlock()
+	if !open {
+		p.writeBudget.release(len(data), true)
+		return nil, errPtyClosed
+	}
+	if generation != currentGeneration {
+		p.writeBudget.release(len(data), true)
+		return nil, errStalePtyWrite
+	}
+	select {
+	case p.writeQueue <- request:
+		return request.result, nil
+	case <-p.done:
+		p.writeBudget.release(len(data), true)
+		return nil, errPtyClosed
+	default:
+		p.writeBudget.release(len(data), true)
+		return nil, errPtyWriteQueueFull
+	}
+}
+
+func (p *Pty) enqueueReservedWrite(request ptyWrite) (<-chan error, error) {
 	p.writeEnqueueMu.Lock()
 	defer p.writeEnqueueMu.Unlock()
 
 	select {
 	case <-p.done:
+		p.writeBudget.release(len(request.data), request.interactive)
 		return nil, errPtyClosed
 	default:
 	}
@@ -222,25 +367,18 @@ func (p *Pty) enqueueWrite(generation uint64, data []byte) (<-chan error, error)
 	currentGeneration := p.writeGeneration
 	p.mu.Unlock()
 	if !open {
+		p.writeBudget.release(len(request.data), request.interactive)
 		return nil, errPtyClosed
 	}
-	if generation != currentGeneration {
+	if request.generation != currentGeneration {
+		p.writeBudget.release(len(request.data), request.interactive)
 		return nil, errStalePtyWrite
-	}
-	if !p.writeBudget.acquire(len(data), p.done) {
-		return nil, errPtyClosed
-	}
-
-	request := ptyWrite{
-		generation: generation,
-		data:       append([]byte(nil), data...),
-		result:     make(chan error, 1),
 	}
 	select {
 	case p.writeQueue <- request:
 		return request.result, nil
 	case <-p.done:
-		p.writeBudget.release(len(data))
+		p.writeBudget.release(len(request.data), request.interactive)
 		return nil, errPtyClosed
 	}
 }
@@ -324,7 +462,7 @@ func (p *Pty) writeLoop() {
 }
 
 func (p *Pty) finishQueuedWrite(request ptyWrite, err error) {
-	p.writeBudget.release(len(request.data))
+	p.writeBudget.release(len(request.data), request.interactive)
 	request.result <- err
 }
 
@@ -332,7 +470,7 @@ func (p *Pty) drainQueuedWrites() {
 	for {
 		select {
 		case request := <-p.writeQueue:
-			p.writeBudget.release(len(request.data))
+			p.writeBudget.release(len(request.data), request.interactive)
 			select {
 			case request.result <- errPtyClosed:
 			default:
@@ -344,6 +482,25 @@ func (p *Pty) drainQueuedWrites() {
 }
 
 // Resize resizes the PTY. TIOCSWINSZ sends SIGWINCH to the foreground process group.
+// State returns a snapshot without exposing the process or I/O handles.
+func (p *Pty) State() PtyState {
+	if p == nil {
+		return PtyState{}
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	state := PtyState{
+		Running: p.ptmx != nil && !p.writeClosed && !p.processExited,
+		Rows:    p.lastRows,
+		Cols:    p.lastCols,
+	}
+	if p.cmd != nil && p.cmd.Process != nil {
+		state.PID = p.cmd.Process.Pid
+	}
+	return state
+}
+
 func (p *Pty) Resize(rows, cols int) error {
 	if err := validateTerminalSize(rows, cols); err != nil {
 		return fmt.Errorf("invalid pty size %dx%d: %w", rows, cols, err)
@@ -401,6 +558,9 @@ func (p *Pty) Close() error {
 		if p.writerDone != nil {
 			<-p.writerDone
 			p.drainQueuedWrites()
+		}
+		if p.readDone != nil {
+			<-p.readDone
 		}
 	})
 	return p.closeErr
@@ -460,7 +620,7 @@ func (p *Pty) readLoop() {
 	if p.readDone != nil {
 		defer close(p.readDone)
 	}
-	defer close(p.Errors)
+	defer close(p.errors)
 	if p.rawTrace != nil {
 		defer p.rawTrace.Close()
 	}
@@ -478,15 +638,13 @@ func (p *Pty) readLoop() {
 		if n > 0 {
 			data := make([]byte, n)
 			copy(data, buf[:n])
-			if p.rawTrace != nil {
-				_, _ = p.rawTrace.Write(data)
-			}
+			p.writeTrace(&p.rawTrace, data, "raw PTY trace")
 			if p.rawTraceChunks != nil {
-				_, _ = fmt.Fprintf(p.rawTraceChunks, "%d\n", len(data))
+				p.writeTrace(&p.rawTraceChunks, []byte(strconv.Itoa(len(data))+"\n"), "PTY trace chunk index")
 			}
 
 			select {
-			case p.Output <- data:
+			case p.output <- data:
 			case <-p.done:
 				return
 			}
@@ -504,7 +662,7 @@ func (p *Pty) readLoop() {
 				p.terminalErr = err
 				p.mu.Unlock()
 				select {
-				case p.Errors <- err:
+				case p.errors <- err:
 				default:
 				}
 			}
@@ -528,6 +686,13 @@ type PtyExitMsg struct {
 	ExitCode      int
 	Signal        os.Signal
 	Err           error
+}
+
+// PtyWarningMsg reports a nonfatal PTY diagnostic such as trace I/O failure.
+type PtyWarningMsg struct {
+	SessionID  string
+	Generation uint64
+	Err        error
 }
 
 // PtyErrorMsg reports an error from a standalone PTY helper such as SendBytes.
@@ -561,12 +726,19 @@ func (p *Pty) Listen(sessionID string) tea.Cmd {
 		if p.readDone != nil {
 			for {
 				select {
-				case data := <-p.Output:
+				case data := <-p.output:
 					return PtyOutputMsg{SessionID: sessionID, Data: data}
+				case warning := <-p.warnings:
+					return PtyWarningMsg{SessionID: sessionID, Err: warning}
 				case <-p.readDone:
 					select {
-					case data := <-p.Output:
+					case data := <-p.output:
 						return PtyOutputMsg{SessionID: sessionID, Data: data}
+					default:
+					}
+					select {
+					case warning := <-p.warnings:
+						return PtyWarningMsg{SessionID: sessionID, Err: warning}
 					default:
 					}
 					return p.exitMessage(sessionID)
@@ -576,16 +748,18 @@ func (p *Pty) Listen(sessionID string) tea.Cmd {
 
 		// Compatibility path for tests or manually-constructed Pty values.
 		select {
-		case data, ok := <-p.Output:
+		case data, ok := <-p.output:
 			if !ok {
 				return PtyExitMsg{SessionID: sessionID}
 			}
 			return PtyOutputMsg{SessionID: sessionID, Data: data}
-		case err, ok := <-p.Errors:
+		case err, ok := <-p.errors:
 			if !ok {
 				return PtyExitMsg{SessionID: sessionID}
 			}
 			return PtyExitMsg{SessionID: sessionID, Err: err}
+		case warning := <-p.warnings:
+			return PtyWarningMsg{SessionID: sessionID, Err: warning}
 		}
 	}
 }

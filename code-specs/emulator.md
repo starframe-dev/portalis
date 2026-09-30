@@ -35,13 +35,13 @@ func (e *Emulator) Start() tea.Cmd
 func (e *Emulator) StartSync(extraEnv []string) error
 ```
 
-Запускает PTY синхронно с дополнительными переменными окружения. Не возвращает `tea.Cmd` — PTY готов сразу. Возвращает ошибку при неудаче.
+Запускает PTY синхронно с дополнительными переменными окружения. Не возвращает `tea.Cmd` — PTY готов сразу. Возвращает ошибку при неудаче spawn или initial resize; при ошибке resize уже запущенный PTY остаётся прикреплённым.
 
 ```go
 func (e *Emulator) StartWithEnv(extraEnv []string) tea.Cmd
 ```
 
-Запуск PTY с переменными окружения. Возвращает `tea.Cmd`, завершающий работу и возвращающий `PtyReadyMsg` или `PtyExitMsg`.
+Запуск PTY с переменными окружения. Возвращает `tea.Cmd`, завершающий работу и возвращающий `PtyReadyMsg` или `PtyExitMsg`. Ошибка начального resize не завершает сессию: она передаётся в `PtyReadyMsg.ResizeErr`.
 
 ```go
 func (e *Emulator) SetScrollbackLimit(limit int)
@@ -97,23 +97,21 @@ func (e *Emulator) Update(msg tea.Msg) tea.Cmd
 
 Обрабатывает сообщения.
 
-### Callbacks
+### Callbacks и snapshots
+
+Callbacks регистрируются setter-ами и вызываются вне `Emulator.mu`, поэтому обработчик может повторно вызывать методы эмулятора:
 
 ```go
-OnCWDChange             func(string)
-OnCommandHistoryChanged func([]string)
-OnError                 func(error)
+e.SetOnCWDChange(func(WorkingDirectory) {})
+e.SetOnTitleChange(func(string) {})
+e.SetOnCommandHistoryChanged(func([]string) {})
+e.SetOnError(func(error) {})
+e.SetOnExit(func(PtyExitMsg) {})
 ```
 
-Поля обратных вызовов для CWD, истории и PTY/clipboard ошибок. Вызываются вне `Emulator.mu`, поэтому обработчик может повторно вызывать методы эмулятора. Срез истории передаётся как копия.
+`SetOnCWDChange` передаёт `WorkingDirectory{Host, Path, Local}`. Для текущего места доступны `CurrentWorkingDirectory() (WorkingDirectory, bool)` и convenience getter `CWD() string`; заголовок OSC 0/2 читается через `Title()`.
 
-### Debug
-
-```go
-func (e *Emulator) Pty() *Pty
-```
-
-Возвращает внутренний PTY для отладки. Не читайте одновременно `Pty.Output` и сообщения из `Listen`; используйте только одного потребителя.
+Сырой PTY accessor отсутствует. `PtyState()` возвращает snapshot (`Running`, `PID`, `Rows`, `Cols`), не раскрывая process и I/O handles. Историю можно получить копией через `CommandHistorySnapshot()`; новые записи эвристически извлекаются из видимой строки перед prompt и не являются shell history.
 
 ## Типы сообщений
 
@@ -141,11 +139,13 @@ type CursorBlinkMsg struct{}
 ```go
 type PtyReadyMsg struct {
     SessionID      string
+    Generation     uint64
     AlreadyRunning bool
+    ResizeErr      error
 }
 ```
 
-Подаётся, когда PTY готов к прослушиванию.
+Подаётся, когда PTY готов к прослушиванию. `ResizeErr` сообщает non-fatal ошибку применения начального размера; `Update` передаёт её в `OnError` и запускает listener.
 
 ### PtyExitMsg
 
@@ -162,29 +162,24 @@ type PtyExitMsg struct {
 
 Подаётся при завершении PTY, в том числе при нормальном выходе. `Err` содержит только инфраструктурную ошибку; статус процесса доступен в отдельных полях.
 
+### PtyWarningMsg
+
+```go
+type PtyWarningMsg struct {
+    SessionID  string
+    Generation uint64
+    Err        error
+}
+```
+
+Сообщает о non-fatal PTY предупреждении (например, ошибке bounded raw trace). После callback `OnError` listener продолжается.
+
 ## Структура данных Emulator
 
 ```go
 type Emulator struct {
-    SessionID string          // Идентификатор сессии
-    ChatName  string          // Имя чата/сессии
-    cmd       string          // Команда для запуска (bash/sh)
-    args      []string        // Аргументы команды
-    screen    *Screen         // Экран терминала
-    parser    *Parser         // Парсер вывода
-    pty       *Pty            // PTY процесс
-    focused   bool            // Сфокусирован или нет
-    width     int             // Ширина панели
-    height    int             // Высота панели
-    stopped   bool            // Завершена ли сессия
-    cwd       string          // Последняя рабочая директория (OSC 7)
-    commandHistory []string       // История команд (max 1000)
-    initialCWD string          // Изначальная рабочая директория
-    scrollbackLimit int          // Лимит строк scrollback
-    scrollbackCells int          // Суммарное число ячеек
-    pressX, pressY int         // Позиция нажатия мыши
-    dragSelecting bool          // В процессе ли drag-выбора
-    mu        sync.RWMutex   // Мьютекс для синхронизации
+    // Все поля состояния и callback storage закрыты.
+    // Чтение выполняется через snapshot/getter-методы, изменение — через setter-ы.
 }
 ```
 
@@ -282,8 +277,9 @@ func mouseToBytes(msg tea.MouseMsg) []byte
 ### Обработка ресайза
 
 - `WindowSizeMsg` содержит размер всего окна и намеренно игнорируется; host wrapper преобразует его в `ResizeMsg` с размером области эмулятора.
-- `ResizeMsg` задаёт размер контента, обновляет экран и применяет актуальный размер к PTY после attach.
-- Размеры валидируются до изменения состояния; `TIOCSWINSZ` сам посылает `SIGWINCH` foreground process group.
+- `ResizeMsg` задаёт запрошенный размер отдельно от последнего успешно применённого.
+- Без PTY размер экрана применяется сразу; с активным PTY сначала выполняется `TIOCSWINSZ`, и только при успехе меняются Screen/applied dimensions. Ошибка возвращается как non-fatal `PtyWarningMsg`, PTY и предыдущий размер остаются в силе.
+- Если во время ioctl поступило новое поколение resize, применяется самый свежий запрос; ошибка устаревшего поколения не отменяет новый запрос. `TIOCSWINSZ` сам посылает `SIGWINCH` foreground process group.
 
 ### Скроллинг
 
@@ -303,10 +299,10 @@ func mouseToBytes(msg tea.MouseMsg) []byte
 ## Семантика lifecycle и ответов терминала
 
 - PTY создаётся вне \`Emulator.mu\`; lifecycle token фиксируется до spawn, поэтому \`Stop\`/\`Close\` могут отменить незавершённый запуск.
-- \`PtyReadyMsg\`, \`PtyOutputMsg\` и \`PtyExitMsg\` содержат точное generation; ноль не считается wildcard.
+- \`PtyReadyMsg\`, \`PtyOutputMsg\`, \`PtyWarningMsg\` и \`PtyExitMsg\` содержат точное generation; ноль не считается wildcard.
 - DSR/DA ответы накапливаются при разборе и записываются в PTY после снятия \`Emulator.mu\`.
-- \`OnError\` получает PTY/clipboard ошибки; все внешние callbacks вызываются вне mutex и могут повторно вызывать API.
+- \`OnError\` получает PTY/clipboard ошибки и non-fatal diagnostics; все внешние callbacks вызываются вне mutex и могут повторно вызывать API.
 - \`Focus()\`/\`Blur()\` возвращают \`tea.Cmd\`; при включённом child режиме \`?1004\` отправляются \`CSI I\`/\`CSI O\`. \`Update\` принимает Bubble Tea \`FocusMsg\`/\`BlurMsg\`.
 - \`Close()\`/\`Stop()\` возвращают первую ошибку очистки и удаляют отслеживаемые clipboard temp-файлы.
-- Аргументы конструктора, environment и восстановленная история копируются; история хранит не более 1000 последних команд.
-- \`PtyExitMsg\` дополнительно сообщает process exit code/signal; новые поля ломают позиционные literals и требуют подходящего major semver.
+- Аргументы конструктора, environment и восстановленная история копируются; command capture эвристически считывается с видимой строки и не является shell history. Список ограничен 1000 entries.
+- \`PtyExitMsg\` сообщает process exit code/signal; используйте именованные literals, поскольку позиционные literals несовместимы при расширении структуры.

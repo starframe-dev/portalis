@@ -73,7 +73,7 @@ func assertStressScreen(t *testing.T, screen *Screen) {
 	t.Helper()
 
 	var plain strings.Builder
-	for row := 0; row < screen.Rows; row++ {
+	for row := 0; row < screen.rows; row++ {
 		plain.WriteString(screen.LineText(row))
 		plain.WriteByte('\n')
 	}
@@ -101,7 +101,7 @@ func assertStressScreen(t *testing.T, screen *Screen) {
 		}
 	}
 
-	for row, cells := range screen.Cells {
+	for row, cells := range screen.cells {
 		for col, cell := range cells {
 			if cell.Continuation {
 				if col == 0 || cells[col-1].Continuation || cellDisplayWidth(cells[col-1]) != 2 {
@@ -119,7 +119,7 @@ func assertStressScreen(t *testing.T, screen *Screen) {
 func stressScreenChecksum(screen *Screen) uint64 {
 	hash := fnv.New64a()
 	var encoded [8]byte
-	for _, row := range screen.Cells {
+	for _, row := range screen.cells {
 		for _, cell := range row {
 			binary.LittleEndian.PutUint32(encoded[:4], uint32(cell.Rune))
 			encoded[4] = byte(cell.Style)

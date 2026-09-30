@@ -6,6 +6,7 @@ import (
 	"image/color"
 	"image/png"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
@@ -35,9 +36,19 @@ func TestCommandOutputLimitedEnforcesBudgetAndTimeout(t *testing.T) {
 	}
 }
 
+func privateClipboardTestDir(t *testing.T) string {
+	t.Helper()
+	store, err := newClipboardTempStore(DefaultClipboardTempPolicy())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.close() })
+	return store.directory()
+}
+
 func TestClipboardImageSwiftScriptUsesConfiguredByteLimit(t *testing.T) {
 	script := clipboardImageSwiftScript()
-	if strings.Contains(script, "__MAX_CLIPBOARD_BYTES__") || !strings.Contains(script, strconv.Itoa(maxClipboardBytes)) {
+	if strings.Contains(script, "__MAX_CLIPBOARD_BYTES__") || !strings.Contains(script, strconv.Itoa(maxClipboardBytes)) || !strings.Contains(script, "posixPermissions") || !strings.Contains(script, "CommandLine.arguments[1]") {
 		t.Fatalf("Swift reader does not use configured clipboard limit")
 	}
 }
@@ -54,12 +65,15 @@ func TestParseClipboardImageSwiftOutput(t *testing.T) {
 	}
 }
 
-func TestClipboardImagePixelBudgetAndPrivateTempFile(t *testing.T) {
-	if err := validateClipboardImageConfig(image.Config{Width: 5000, Height: 5000}); err != nil {
-		t.Fatalf("image at pixel budget rejected: %v", err)
+func TestClipboardImageDecodedBudgetAndPrivateTempFile(t *testing.T) {
+	if err := validateClipboardImageConfig(image.Config{Width: 4096, Height: 4096}); err != nil {
+		t.Fatalf("image at decoded-byte budget rejected: %v", err)
 	}
-	if err := validateClipboardImageConfig(image.Config{Width: 5001, Height: 5000}); err == nil {
-		t.Fatal("image over pixel budget was accepted")
+	if err := validateClipboardImageConfig(image.Config{Width: 5000, Height: 5000}); err == nil || !strings.Contains(err.Error(), "decoded data") {
+		t.Fatalf("image over decoded-byte budget error = %v", err)
+	}
+	if err := validateClipboardImageConfig(image.Config{Width: 5001, Height: 5000}); err == nil || !strings.Contains(err.Error(), "pixel limit") {
+		t.Fatalf("image over pixel budget error = %v", err)
 	}
 
 	img := image.NewRGBA(image.Rect(0, 0, 2, 2))
@@ -68,11 +82,11 @@ func TestClipboardImagePixelBudgetAndPrivateTempFile(t *testing.T) {
 	if err := png.Encode(&encoded, img); err != nil {
 		t.Fatal(err)
 	}
-	path, err := saveImageBytes(encoded.Bytes())
+	tempDir := privateClipboardTestDir(t)
+	path, err := saveImageBytes(encoded.Bytes(), tempDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	t.Cleanup(func() { _ = os.Remove(path) })
 	info, err := os.Stat(path)
 	if err != nil {
 		t.Fatal(err)
@@ -112,13 +126,14 @@ func TestPasteUsesCurrentBracketedPasteMode(t *testing.T) {
 
 			emulator := NewEmulator("paste-session", "Paste", "/bin/sh", nil)
 			emulator.pty = pty
+			defer emulator.Close()
 			emulator.screen = NewScreen(24, 80)
 			emulator.listenerGeneration = 1
 			emulator.screen.bracketedPaste = test.initialMode
 
 			readStarted := make(chan struct{})
 			continueRead := make(chan struct{})
-			emulator.readClipboard = func() (string, string, error) {
+			emulator.readClipboard = func(string) (string, string, error) {
 				close(readStarted)
 				<-continueRead
 				return "paste", "", nil
@@ -159,5 +174,133 @@ func TestPasteUsesCurrentBracketedPasteMode(t *testing.T) {
 				t.Fatalf("paste output = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func fakeWlPaste(t *testing.T, mimeTypes, textPayload, imagePayload []byte) string {
+	t.Helper()
+	binDir := t.TempDir()
+	fixtureDir := t.TempDir()
+	writeFixture := func(name string, data []byte) string {
+		path := filepath.Join(fixtureDir, name)
+		if err := os.WriteFile(path, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	t.Setenv("WL_TYPES_FILE", writeFixture("types", mimeTypes))
+	t.Setenv("WL_TEXT_FILE", writeFixture("text", textPayload))
+	t.Setenv("WL_IMAGE_FILE", writeFixture("image", imagePayload))
+	t.Setenv("PATH", binDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	script := `#!/bin/sh
+if [ "$1" = "--list-types" ]; then
+    cat "$WL_TYPES_FILE"
+    exit 0
+fi
+mime=""
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--type" ]; then
+        shift
+        mime="$1"
+    fi
+    shift
+done
+case "$mime" in
+    image/png) cat "$WL_IMAGE_FILE" ;;
+    text/plain\;charset=utf-8|text/plain|UTF8_STRING|STRING) cat "$WL_TEXT_FILE" ;;
+    *) exit 3 ;;
+esac
+`
+	toolPath := filepath.Join(binDir, "wl-paste")
+	if err := os.WriteFile(toolPath, []byte(script), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	return toolPath
+}
+
+func TestPasteWaylandUsesAdvertisedMIMEOnly(t *testing.T) {
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, img); err != nil {
+		t.Fatal(err)
+	}
+
+	t.Run("text MIME", func(t *testing.T) {
+		fakeWlPaste(t, []byte("text/plain;charset=utf-8\n"), []byte("hello"), nil)
+		text, imagePath, err := pasteWayland(t.TempDir())
+		if err != nil || text != "hello" || imagePath != "" {
+			t.Fatalf("pasteWayland text = %q, %q, %v", text, imagePath, err)
+		}
+	})
+
+	t.Run("PNG MIME", func(t *testing.T) {
+		fakeWlPaste(t, []byte("image/png\n"), nil, encoded.Bytes())
+		tempDir := privateClipboardTestDir(t)
+		text, imagePath, err := pasteWayland(tempDir)
+		if err != nil || text != "" || imagePath == "" {
+			t.Fatalf("pasteWayland image = %q, %q, %v", text, imagePath, err)
+		}
+		if filepath.Dir(imagePath) != tempDir {
+			t.Fatalf("image path %q escaped temp dir %q", imagePath, tempDir)
+		}
+		info, err := os.Stat(imagePath)
+		if err != nil || info.Mode().Perm() != 0o600 {
+			t.Fatalf("private image file = %v, %v", info, err)
+		}
+	})
+
+	t.Run("unsupported binary MIME is not guessed as PNG", func(t *testing.T) {
+		fakeWlPaste(t, []byte("application/octet-stream\n"), encoded.Bytes(), encoded.Bytes())
+		if _, _, err := pasteWayland(t.TempDir()); err == nil || !strings.Contains(err.Error(), "no supported") {
+			t.Fatalf("unsupported MIME error = %v", err)
+		}
+	})
+}
+
+func TestClipboardTempStorePermissionsQuotaExpiryAndCleanup(t *testing.T) {
+	policy := ClipboardTempPolicy{MaxFiles: 1, MaxBytes: 1 << 20, TTL: time.Hour}
+	store, err := newClipboardTempStore(policy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.close()
+	info, err := os.Stat(store.directory())
+	if err != nil || info.Mode().Perm() != 0o700 {
+		t.Fatalf("private directory = %v, %v", info, err)
+	}
+
+	img := image.NewRGBA(image.Rect(0, 0, 1, 1))
+	var encoded bytes.Buffer
+	if err := png.Encode(&encoded, img); err != nil {
+		t.Fatal(err)
+	}
+	first, err := saveImageBytes(encoded.Bytes(), store.directory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.register(first); err != nil {
+		t.Fatal(err)
+	}
+	second, err := saveImageBytes(encoded.Bytes(), store.directory())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.register(second); err == nil {
+		t.Fatal("per-session file quota was not enforced")
+	}
+	if err := store.discard(second); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.expire(first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(first); !os.IsNotExist(err) {
+		t.Fatalf("expired image remains: %v", err)
+	}
+	if err := store.close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(store.directory()); !os.IsNotExist(err) {
+		t.Fatalf("private directory remains after close: %v", err)
 	}
 }

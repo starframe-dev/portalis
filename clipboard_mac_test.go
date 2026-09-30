@@ -58,7 +58,7 @@ func TestPasteMac_Image(t *testing.T) {
 	png := writeSamplePNG(t)
 	loadImageIntoClipboard(t, png)
 
-	text, imgPath, err := pasteMac()
+	text, imgPath, err := pasteMac(privateClipboardTestDir(t))
 	if err != nil {
 		t.Fatalf("pasteMac: %v", err)
 	}
@@ -89,7 +89,7 @@ func TestPasteMac_Text(t *testing.T) {
 	if err := command.Run(); err != nil {
 		t.Skipf("pbcopy unavailable: %v", err)
 	}
-	text, imgPath, err := pasteMac()
+	text, imgPath, err := pasteMac(privateClipboardTestDir(t))
 	if err != nil {
 		t.Fatalf("pasteMac: %v", err)
 	}
