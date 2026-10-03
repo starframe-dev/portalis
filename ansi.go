@@ -37,6 +37,11 @@ type Parser struct {
 	altSavedG1LineDrawing bool
 	altSavedUseG1         bool
 	altCharsetSaved       bool
+	dec1049SavedCursor    screenCursorState
+	dec1049SavedG0        bool
+	dec1049SavedG1        bool
+	dec1049SavedUseG1     bool
+	dec1049CursorSaved    bool
 }
 
 type ansiState int
@@ -108,6 +113,29 @@ func (p *Parser) restoreCursorState() {
 	p.useG1 = p.savedUseG1
 }
 
+func (p *Parser) saveDEC1049CursorState() {
+	p.dec1049SavedCursor = p.screen.cursorState()
+	p.dec1049SavedG0 = p.g0LineDrawing
+	p.dec1049SavedG1 = p.g1LineDrawing
+	p.dec1049SavedUseG1 = p.useG1
+	p.dec1049CursorSaved = true
+}
+
+func (p *Parser) restoreDEC1049CursorState() {
+	if !p.dec1049CursorSaved {
+		return
+	}
+	p.screen.restoreCursorState(p.dec1049SavedCursor)
+	p.g0LineDrawing = p.dec1049SavedG0
+	p.g1LineDrawing = p.dec1049SavedG1
+	p.useG1 = p.dec1049SavedUseG1
+	p.dec1049SavedCursor = screenCursorState{}
+	p.dec1049SavedG0 = false
+	p.dec1049SavedG1 = false
+	p.dec1049SavedUseG1 = false
+	p.dec1049CursorSaved = false
+}
+
 // Reset restores power-on screen and parser state at the current dimensions.
 func (p *Parser) Reset() {
 	p.screen.Reset()
@@ -131,6 +159,11 @@ func (p *Parser) resetCharsets() {
 	p.altSavedG1LineDrawing = false
 	p.altSavedUseG1 = false
 	p.altCharsetSaved = false
+	p.dec1049SavedCursor = screenCursorState{}
+	p.dec1049SavedG0 = false
+	p.dec1049SavedG1 = false
+	p.dec1049SavedUseG1 = false
+	p.dec1049CursorSaved = false
 }
 
 func (p *Parser) softReset() {
@@ -140,8 +173,6 @@ func (p *Parser) softReset() {
 	p.buf.Reset()
 	p.utf8Buf = nil
 	p.escapeIntermediate = 0
-	p.lastCWD = WorkingDirectory{}
-	p.lastTitle = ""
 }
 
 // flushUtf8 flushes any incomplete UTF-8 sequence as replacement chars.
@@ -416,8 +447,8 @@ func (p *Parser) handleOSC(payload string) {
 	}
 	switch parts[0] {
 	case "0", "2":
-		title := sanitizeTerminalTitle(parts[1])
-		if title != "" && title != p.lastTitle {
+		title, ok := sanitizeTerminalTitle(parts[1])
+		if ok && title != p.lastTitle {
 			p.lastTitle = title
 			if p.onTitle != nil {
 				p.onTitle(title)
@@ -436,16 +467,16 @@ func (p *Parser) handleOSC(payload string) {
 
 const maxTerminalTitleBytes = 4096
 
-func sanitizeTerminalTitle(title string) string {
-	if len(title) == 0 || len(title) > maxTerminalTitleBytes || !utf8.ValidString(title) {
-		return ""
+func sanitizeTerminalTitle(title string) (string, bool) {
+	if len(title) > maxTerminalTitleBytes || !utf8.ValidString(title) {
+		return "", false
 	}
 	for _, r := range title {
 		if r < 0x20 || (r >= 0x7f && r <= 0x9f) {
-			return ""
+			return "", false
 		}
 	}
-	return title
+	return title, true
 }
 
 func parseOSC7WorkingDirectory(raw string) (WorkingDirectory, bool) {
@@ -737,11 +768,21 @@ func (p *Parser) setPrivateMode(mode int, active bool) {
 			p.screen.markDirty()
 			p.screen.cursorVisible = active
 		}
-	case 1047, 1049:
+	case 1047:
 		if active {
 			p.enterAltScreen()
 		} else {
 			p.exitAltScreen()
+		}
+	case 1049:
+		if active {
+			if !p.screen.altScreen {
+				p.saveDEC1049CursorState()
+				p.enterAltScreen()
+			}
+		} else {
+			p.exitAltScreen()
+			p.restoreDEC1049CursorState()
 		}
 	case 1048:
 		if active {

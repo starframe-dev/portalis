@@ -11,9 +11,9 @@ and forwards keyboard, mouse and resize events.
 - Bounded ANSI/VT subset: CSI, OSC, SGR colors (16 / 256 / 24-bit), UTF-8
 - Child processes default to `TERM=ansi` (8-color terminfo), not xterm-256color; callers can override `TERM`
 - xterm-compatible key encoding (Ctrl/Alt/Shift/F-keys, application cursor mode)
-- DEC modes: `?1` application cursor, `?6` origin, `?7` autowrap, `?25` cursor visibility, `?1000/1002/1003/1006` mouse, `?1004` focus, `?1047/1048/1049` alternate buffer/cursor, `?2004` bracketed paste, `?2026` synchronized output
+- DEC modes: `?1` application cursor, `?6` origin, `?7` autowrap, `?25` cursor visibility, `?1000/1002/1003/1006` mouse, `?1004` focus, `?1047` alternate buffer, `?1048` cursor save/restore, `?1049` alternate buffer with independent cursor/parser save, `?2004` bracketed paste, `?2026` synchronized output
 - Editing sequences: insert mode, tab stops, ICH (`CSI @`), DCH (`CSI P`), ECH (`CSI X`), IL (`CSI L`), DL (`CSI M`), SU (`CSI S`), SD (`CSI T`), VPA (`CSI d`), HPA (`CSI G`)
-- RIS/DECSTR resets, scroll regions, index/reverse index, DEC Special Graphics charset
+- RIS/DECSTR resets, scroll regions, index/reverse index, DEC Special Graphics charset; DECSTR preserves screen text, current cursor position and tab stops
 - OSC 0/2 title tracking and structured OSC 7 locations (`Host`, `Path`, `Local`)
 - System clipboard selection and explicit paste integration (macOS, Wayland, X11)
 - Synchronized output (`CSI ? 2026 h/l`)
@@ -30,7 +30,7 @@ and forwards keyboard, mouse and resize events.
 go get github.com/starframe-dev/portalis
 ```
 
-Requires Go 1.25.8 or later. PTY process support currently targets Unix-like systems (Linux and macOS); Windows is not supported.
+Requires Go 1.26.8 or later. PTY process support currently targets Unix-like systems (Linux and macOS); Windows is not supported.
 
 ## Quick start
 

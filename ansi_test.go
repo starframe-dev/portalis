@@ -386,6 +386,16 @@ func TestOSC0And2TitleCallbacks(t *testing.T) {
 	}
 }
 
+func TestOSCTitleCanBeCleared(t *testing.T) {
+	parser := NewParser(NewScreen(1, 10))
+	var titles []string
+	parser.SetTitleCallback(func(title string) { titles = append(titles, title) })
+	parser.Feed([]byte("\x1b]2;Build\x07\x1b]0;\x1b\\\x1b]2;\x07"))
+	if len(titles) != 2 || titles[0] != "Build" || titles[1] != "" {
+		t.Fatalf("title callbacks = %#v, want [Build, empty clear]", titles)
+	}
+}
+
 func TestDSRRepliesUseActualCursorAndSurviveSplitCSI(t *testing.T) {
 	s := NewScreen(6, 10)
 	p := NewParser(s)
@@ -452,18 +462,113 @@ func TestParserTabStopsAndInsertMode(t *testing.T) {
 	}
 }
 
-func TestDEC1047AlternateBufferAndDEC1048CursorSave(t *testing.T) {
+func TestDEC1047DoesNotUse1049CursorSaveSemantics(t *testing.T) {
 	screen := NewScreen(2, 8)
 	parser := NewParser(screen)
-	parser.Feed([]byte("main\x1b[?1047halt\x1b[?1047l"))
+	parser.Feed([]byte("main"))
+	screen.SetCursor(0, 1)
+	parser.Feed([]byte("\x1b7"))
+	screen.SetCursor(0, 4)
+	parser.Feed([]byte("\x1b[?1047h"))
+	if !screen.altScreen || screen.LineText(0) != "" {
+		t.Fatalf("1047 did not enter the alternate buffer: alt=%v line=%q", screen.altScreen, screen.LineText(0))
+	}
+	parser.Feed([]byte("alt"))
+	parser.Feed([]byte("\x1b[?1047l"))
 	if screen.altScreen || screen.LineText(0) != "main" {
-		t.Fatalf("1047 did not restore main buffer: alt=%v line=%q", screen.altScreen, screen.LineText(0))
+		t.Fatalf("1047 did not restore primary buffer: alt=%v line=%q", screen.altScreen, screen.LineText(0))
+	}
+	parser.Feed([]byte("\x1b8"))
+	if row, col := screen.CursorPos(); row != 0 || col != 1 {
+		t.Fatalf("1047 changed DECSC save slot: cursor=(%d,%d), want (0,1)", row, col)
+	}
+}
+
+func TestDEC1048SaveRestoreCursorState(t *testing.T) {
+	screen := NewScreen(3, 8)
+	parser := NewParser(screen)
+	parser.Feed([]byte("\x1b[2;8r\x1b[?6h\x1b(0\x1b)0\x0e\x1b[31m"))
+	screen.SetCursor(1, 7)
+	screen.Put('X')
+	parser.Feed([]byte("\x1b[?1048h"))
+	parser.Feed([]byte("\x1b[?6l\x1b[?7l\x1b(B\x1b)B\x0f\x1b[32m"))
+	screen.SetCursor(0, 2)
+	parser.Feed([]byte("\x1b[?1048l"))
+
+	if row, col := screen.CursorPos(); row != 1 || col != 7 {
+		t.Fatalf("1048 cursor=(%d,%d), want (1,7)", row, col)
+	}
+	if screen.cursor.FG != lipgloss.Color("#800000") || screen.cursor.Style != 0 {
+		t.Fatalf("1048 rendition = fg %q style %v, want saved red normal style", screen.cursor.FG, screen.cursor.Style)
+	}
+	if !screen.originMode || !screen.autoWrap || !screen.wrapPending {
+		t.Fatalf("1048 cursor modes origin=%v wrap=%v pending=%v, want true/true/true", screen.originMode, screen.autoWrap, screen.wrapPending)
+	}
+	if !parser.g0LineDrawing || !parser.g1LineDrawing || !parser.useG1 {
+		t.Fatalf("1048 charset state = G0:%v G1:%v useG1:%v, want all saved", parser.g0LineDrawing, parser.g1LineDrawing, parser.useG1)
+	}
+}
+
+func TestDEC1049SavesAndRestoresCursorAndCharset(t *testing.T) {
+	screen := NewScreen(3, 8)
+	parser := NewParser(screen)
+	parser.Feed([]byte("main\x1b[2;3r\x1b[?6h\x1b[?7l\x1b[31m\x1b(0\x1b)0\x0e"))
+	screen.SetCursor(2, 7)
+	screen.Put('X')
+	parser.Feed([]byte("\x1b[?1049h"))
+	if !screen.altScreen || screen.LineText(0) != "" {
+		t.Fatalf("1049 did not enter a cleared alternate buffer: alt=%v line=%q", screen.altScreen, screen.LineText(0))
+	}
+	parser.Feed([]byte("\x1b(B\x1b)B\x0f\x1b[32m\x1b[?6l\x1b[?7h"))
+	screen.SetCursor(0, 3)
+	parser.Feed([]byte("\x1b[?1049l"))
+
+	if screen.altScreen || screen.LineText(0) != "main" {
+		t.Fatalf("1049 did not restore primary buffer: alt=%v line=%q", screen.altScreen, screen.LineText(0))
+	}
+	if row, col := screen.CursorPos(); row != 2 || col != 7 {
+		t.Fatalf("1049 cursor=(%d,%d), want (2,7)", row, col)
+	}
+	if screen.cursor.FG != lipgloss.Color("#800000") || !screen.originMode || screen.autoWrap {
+		t.Fatalf("1049 cursor state fg=%q origin=%v wrap=%v, want saved red/origin/no-wrap", screen.cursor.FG, screen.originMode, screen.autoWrap)
+	}
+	if screen.scrollTop != 1 || screen.scrollBottom != 2 {
+		t.Fatalf("1049 scroll region = %d..%d, want 1..2", screen.scrollTop, screen.scrollBottom)
+	}
+	if !parser.g0LineDrawing || !parser.g1LineDrawing || !parser.useG1 {
+		t.Fatalf("1049 charset state = G0:%v G1:%v useG1:%v, want all saved", parser.g0LineDrawing, parser.g1LineDrawing, parser.useG1)
 	}
 
+	parser.Feed([]byte("\x1b[?1049h"))
+	if got := screen.LineText(0); got != "" {
+		t.Fatalf("re-entered 1049 alternate buffer contains stale text %q", got)
+	}
+	parser.Feed([]byte("\x1b[?1049l"))
+}
+
+func TestDEC1047And1049Differ(t *testing.T) {
+	screen := NewScreen(2, 8)
+	parser := NewParser(screen)
+	screen.SetCursor(0, 1)
+	parser.Feed([]byte("\x1b[?1048h"))
 	screen.SetCursor(0, 3)
-	parser.Feed([]byte("\x1b[?1048h\x1b[2;6H\x1b[?1048l"))
-	if row, col := screen.CursorPos(); row != 0 || col != 3 {
-		t.Fatalf("1048 restored cursor to (%d,%d), want (0,3)", row, col)
+	parser.Feed([]byte("\x1b[?1047h"))
+	screen.SetCursor(1, 4)
+	parser.Feed([]byte("\x1b[?1047l\x1b[?1048l"))
+	if row, col := screen.CursorPos(); row != 0 || col != 1 {
+		t.Fatalf("1047 altered independent 1048 state: cursor=(%d,%d), want (0,1)", row, col)
+	}
+
+	screen.SetCursor(0, 2)
+	parser.Feed([]byte("\x1b[?1049h"))
+	screen.SetCursor(1, 5)
+	parser.Feed([]byte("\x1b[?1048h\x1b[?1049l"))
+	if row, col := screen.CursorPos(); row != 0 || col != 2 {
+		t.Fatalf("1049 did not restore its own saved state: cursor=(%d,%d), want (0,2)", row, col)
+	}
+	parser.Feed([]byte("\x1b[?1048l"))
+	if row, col := screen.CursorPos(); row != 1 || col != 5 {
+		t.Fatalf("1049 overwrote independent 1048 state: cursor=(%d,%d), want (1,5)", row, col)
 	}
 }
 
@@ -476,23 +581,100 @@ func TestANSITerminfoAlternateCharsetSGR(t *testing.T) {
 	}
 }
 
-func TestParserSoftResetAndRIS(t *testing.T) {
-	screen := NewScreen(2, 8)
+func TestDECSTRPreservesCurrentCursorPosition(t *testing.T) {
+	screen := NewScreen(3, 8)
 	parser := NewParser(screen)
-	parser.Feed([]byte("keep\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[4h\x1b[!p"))
+	screen.SetCursor(2, 5)
+	parser.Feed([]byte("\x1b[!p"))
+	if row, col := screen.CursorPos(); row != 2 || col != 5 {
+		t.Fatalf("DECSTR cursor=(%d,%d), want preserved position (2,5)", row, col)
+	}
+}
+
+func TestDECSTRDoesNotResetTabStopsLikeRIS(t *testing.T) {
+	screen := NewScreen(2, 16)
+	parser := NewParser(screen)
+	parser.Feed([]byte("\x1b[3g\x1b[5G\x1bH\x1b[!p\x1b[1;1H\t"))
+	if _, col := screen.CursorPos(); col != 4 {
+		t.Fatalf("DECSTR lost custom tab stop: col=%d, want 4", col)
+	}
+	parser.Feed([]byte("\x1bc\x1b[1;1H\t"))
+	if _, col := screen.CursorPos(); col != 8 {
+		t.Fatalf("RIS did not restore default tab stops: col=%d, want 8", col)
+	}
+}
+
+func TestDECSTRResetsExpectedModes(t *testing.T) {
+	screen := NewScreen(3, 10)
+	parser := NewParser(screen)
+	parser.Feed([]byte("keep\x1b[2;3r\x1b[?6h\x1b[?7l\x1b[?25l\x1b[?1h\x1b[?1000;1004;2004h\x1b[4h\x1b(0\x1b[31m"))
+	screen.SetCursor(2, 8)
+	parser.Feed([]byte("\x1b[?1048h"))
+	screen.SetCursor(1, 4)
+	parser.Feed([]byte("\x1b[!p"))
+
 	if got := screen.LineText(0); got != "keep" {
 		t.Fatalf("DECSTR cleared text: %q", got)
 	}
-	if !screen.autoWrap || screen.bracketedPaste || !screen.cursorVisible || screen.insertMode {
-		t.Fatalf("DECSTR left terminal modes active: wrap=%v paste=%v cursor=%v insert=%v", screen.autoWrap, screen.bracketedPaste, screen.cursorVisible, screen.insertMode)
+	if row, col := screen.CursorPos(); row != 1 || col != 4 {
+		t.Fatalf("DECSTR cursor=(%d,%d), want preserved (1,4)", row, col)
+	}
+	if screen.cursor.FG != "" || screen.cursor.BG != "" || screen.cursor.Style != 0 {
+		t.Fatalf("DECSTR rendition = %+v, want defaults", screen.cursor)
+	}
+	if screen.originMode || !screen.autoWrap || screen.wrapPending || screen.insertMode || screen.applicationCursor ||
+		!screen.cursorVisible || screen.bracketedPaste || screen.mouseMode1000 || screen.mouseMode1002 ||
+		screen.mouseMode1003 || screen.mouseSGR || screen.focusReporting {
+		t.Fatalf("DECSTR left modes active: origin=%v wrap=%v pending=%v insert=%v appCursor=%v visible=%v paste=%v mouse=%v/%v/%v sgr=%v focus=%v",
+			screen.originMode, screen.autoWrap, screen.wrapPending, screen.insertMode, screen.applicationCursor,
+			screen.cursorVisible, screen.bracketedPaste, screen.mouseMode1000, screen.mouseMode1002,
+			screen.mouseMode1003, screen.mouseSGR, screen.focusReporting)
+	}
+	if screen.scrollTop != 0 || screen.scrollBottom != 2 || parser.g0LineDrawing {
+		t.Fatalf("DECSTR state scroll=%d..%d G0=%v, want full region/default charset", screen.scrollTop, screen.scrollBottom, parser.g0LineDrawing)
+	}
+	parser.Feed([]byte("\x1b[?1048l"))
+	if row, col := screen.CursorPos(); row != 0 || col != 0 {
+		t.Fatalf("DECSTR did not reset saved cursor slot to home: cursor=(%d,%d)", row, col)
+	}
+}
+
+func TestDECSTRAndRISHaveDifferentSemantics(t *testing.T) {
+	screen := NewScreen(2, 8)
+	parser := NewParser(screen)
+	parser.Feed([]byte("keep"))
+	screen.SetCursor(1, 3)
+	parser.Feed([]byte("\x1b[!p"))
+	if screen.LineText(0) != "keep" {
+		t.Fatalf("DECSTR cleared visible text: %q", screen.LineText(0))
+	}
+	if row, col := screen.CursorPos(); row != 1 || col != 3 {
+		t.Fatalf("DECSTR cursor=(%d,%d), want preserved (1,3)", row, col)
 	}
 
-	parser.Feed([]byte("\x1b[?2004h\x1b[?1049halt"))
 	parser.Feed([]byte("\x1bc"))
+	if screen.LineText(0) != "" {
+		t.Fatalf("RIS preserved text after DECSTR: %q", screen.LineText(0))
+	}
+	if row, col := screen.CursorPos(); row != 0 || col != 0 {
+		t.Fatalf("RIS cursor=(%d,%d), want home (0,0)", row, col)
+	}
+}
+
+func TestRISStillPerformsFullReset(t *testing.T) {
+	screen := NewScreen(2, 16)
+	parser := NewParser(screen)
+	parser.Feed([]byte("keep\x1b[3g\x1b[5G\x1bH\x1b[?7l\x1b[?2004h\x1b[?25l\x1b[4h\x1b[2;2r\x1b[2;6H\x1bc"))
 	if screen.LineText(0) != "" || screen.altScreen || screen.bracketedPaste || !screen.cursorVisible {
 		t.Fatalf("RIS did not restore power-on state: line=%q alt=%v paste=%v cursor=%v", screen.LineText(0), screen.altScreen, screen.bracketedPaste, screen.cursorVisible)
 	}
-	if rows, cols := screen.Rows(), screen.Cols(); rows != 2 || cols != 8 {
+	if row, col := screen.CursorPos(); row != 0 || col != 0 {
+		t.Fatalf("RIS cursor=(%d,%d), want home (0,0)", row, col)
+	}
+	if !screen.tabStops[8] || screen.tabStops[4] {
+		t.Fatalf("RIS tab stops not reset: col4=%v col8=%v", screen.tabStops[4], screen.tabStops[8])
+	}
+	if rows, cols := screen.Rows(), screen.Cols(); rows != 2 || cols != 16 {
 		t.Fatalf("RIS changed dimensions to %dx%d", rows, cols)
 	}
 }

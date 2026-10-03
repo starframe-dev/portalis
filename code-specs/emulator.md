@@ -109,7 +109,9 @@ e.SetOnError(func(error) {})
 e.SetOnExit(func(PtyExitMsg) {})
 ```
 
-`SetOnCWDChange` передаёт `WorkingDirectory{Host, Path, Local}`. Для текущего места доступны `CurrentWorkingDirectory() (WorkingDirectory, bool)` и convenience getter `CWD() string`; заголовок OSC 0/2 читается через `Title()`.
+`SetOnCWDChange` передаёт `WorkingDirectory{Host, Path, Local}`. Для текущего места доступны `CurrentWorkingDirectory() (WorkingDirectory, bool)` и convenience getter `CWD() string`; заголовок OSC 0/2 читается через `Title()`. Пустой OSC 0/2 очищает title и передаётся в `SetOnTitleChange`, когда значение действительно меняется.
+
+`SetOnExit` вызывается ровно один раз, когда `Update` принимает событие фактического завершения дочернего процесса (`PtyExitMsg.ProcessExited`). Для доставки callback host должен поддерживать цепочку `Listen()` и передавать полученные сообщения в `Update`. Намеренные `Stop()` и `Close()` не вызывают callback; их устаревшие exit-сообщения игнорируются.
 
 Сырой PTY accessor отсутствует. `PtyState()` возвращает snapshot (`Running`, `PID`, `Rows`, `Cols`), не раскрывая process и I/O handles. Историю можно получить копией через `CommandHistorySnapshot()`; новые записи эвристически извлекаются из видимой строки перед prompt и не являются shell history.
 

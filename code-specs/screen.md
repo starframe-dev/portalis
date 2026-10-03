@@ -191,7 +191,7 @@ if err := s.ResizeChecked(40, 120); err != nil {
 
 #### `Reset()` и `SoftReset()`
 
-`Reset()` восстанавливает power-on screen state без изменения размеров и настроенного scrollback limit. `SoftReset()` сбрасывает режимы и rendition/cursor state, но сохраняет текст основного экрана.
+`Reset()` восстанавливает power-on screen state без изменения размеров и настроенного scrollback limit. `SoftReset()` сбрасывает поддерживаемые режимы/rendition и возвращает DECSC save slot к home, сохраняя видимый текст/scrollback, текущую позицию курсора и настроенные tab stops.
 
 ### Альтернативный экран (ANSI SGR)
 
@@ -209,7 +209,7 @@ if err := s.ResizeChecked(40, 120); err != nil {
 
 - Восстанавливает сохранённый экран и курсор
 - Сохраняет main-buffer margins как full-screen при изменении высоты; custom DECSTBM margins clamp-ятся в новой геометрии
-- Parser сохраняет/восстанавливает G0/G1 charset state для `?1049`
+- Parser восстанавливает G0/G1 charset state при выходе; `?1049` дополнительно хранит отдельный cursor/parser snapshot, не затрагивая DECSC/`?1048` slot
 - Сбрасывает `wrapPending`
 
 ### Выделение текста
@@ -407,7 +407,7 @@ s.SetSync(false) // восстановление последнего кадра
 
 ## Состояния DEC
 
-- Основной и alternate buffers имеют независимые снимки экрана. \`?1049\` использует отдельный слот сохранения и не перезаписывает cursor из DECSC/DECRC.
+- Основной и alternate buffers имеют независимые снимки экрана. \`?1047\` не использует DECSC save slot; \`?1049\` хранит отдельный cursor/parser snapshot и не перезаписывает DECSC/\`?1048\` slot.
 - При входе в alternate screen сохраняются main cursor, scroll region, origin mode, autowrap и wrap-pending; при выходе они восстанавливаются и clamp-ятся к актуальным размерам.
 - DECSC/DECRC сохраняет rendition cursor, а также origin/autowrap/wrap state.
 - \`originMode\` ограничивает вертикальное позиционирование и движение областью DECSTBM.
@@ -417,7 +417,7 @@ s.SetSync(false) // восстановление последнего кадра
 
 Erase, вставленные пустые ячейки/строки, строки после прокрутки и очистка всего
 экрана используют текущий фон cursor (BCE), а не нулевой цвет ячейки. Это
-сохраняет корректный вид цветных TUI при \`TERM=xterm-256color\`.
+сохраняет корректный вид TUI при 256-color SGR; Portalis по умолчанию передаёт \`TERM=ansi\`.
 
 ## Wide cells при изменении размера
 

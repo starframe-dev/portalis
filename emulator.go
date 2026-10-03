@@ -185,7 +185,9 @@ func (e *Emulator) SetOnError(fn func(error)) {
 	e.mu.Unlock()
 }
 
-// SetOnExit registers a callback invoked when the child process has exited.
+// SetOnExit registers a callback for a child exit accepted by Update. It runs
+// exactly once when ProcessExited is true; intentional Stop and Close suppress
+// it. Hosts must keep the Listen command chain alive and route messages to Update.
 func (e *Emulator) SetOnExit(fn func(PtyExitMsg)) {
 	e.mu.Lock()
 	e.onExit = fn
