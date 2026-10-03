@@ -83,4 +83,5 @@
 [2026-09-30] Проблема: GitHub description ошибочно заявлял OSC 52, а `main` не был защищён → Решение: убрать OSC 52 и настроить verified PR/strict CI protection без signed-commit requirement.
 [2026-09-30] Проблема: итоговый diff не мог получить GitHub CI и manual matrix без публикации → Решение: оставить diff локальным без commit/push, не выдавать baseline CI за проверку diff и явно обозначить release gate blocker.
 [2026-09-30] Проблема: `functions.grep` с `literal=true` трактовал pipe-separated test names как одну строку, а не regex alternation → Решение: для alternation использовать regex mode; для literal matches запускать отдельные queries.
+[2026-10-03] Проблема: final-gate docs продолжали описывать unpublished diff после разрешённой публикации → Решение: commit `033024aa3050c1b196bcce98b15b93be272ddf3f` опубликован в PR #6; ordinary CI и workflow_dispatch release matrix прошли 4/4, результаты внесены в specs; tag/release не создавались.
 

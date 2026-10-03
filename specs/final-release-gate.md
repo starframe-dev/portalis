@@ -33,10 +33,11 @@ DECSTR сверялся с VT510 Programmer Information (https://vt100.net/docs/
 - [x] `FuzzParserFeed -fuzztime=60s`: PASS, 96 352 executions (57 new interesting inputs).
 - [x] Локально cross-compiled test binaries на Go 1.26.8 для Linux/macOS amd64/arm64; `actionlint`, `gofmt -l .` и `git diff --check` прошли.
 - [x] GitHub metadata перечитаны после изменения: description больше не заявляет OSC 52; branch protection включает PR, strict/up-to-date проверки `test (ubuntu-latest)`, `test (macos-latest)`, `static-analysis`, `pty-integration`, `vulnerability-scan`, запрет force push/deletion, approvals `0`, `required_signatures.enabled=false`.
-- [ ] Обычный GitHub CI для локального diff и ручная GitHub release matrix 4/4 для итогового commit не запущены: локальный diff не опубликован. Baseline CI success не заменяет эти проверки.
+- [x] PR #6 ordinary GitHub CI run [37151764966](https://github.com/starframe-dev/portalis/actions/runs/37151764966): `test (ubuntu-latest)`, `test (macos-latest)`, `static-analysis`, `pty-integration`, `vulnerability-scan` — все прошли. `release-verification` был ожидаемо skipped на `pull_request`.
+- [x] Ручной `workflow_dispatch` run [37151877833](https://github.com/starframe-dev/portalis/actions/runs/37151877833) на code commit `033024aa3050c1b196bcce98b15b93be272ddf3f` завершился success; release matrix `linux/amd64`, `linux/arm64`, `darwin/amd64`, `darwin/arm64` прошла 4/4. В том же run также прошли ordinary CI jobs, включая Linux PTY runtime.
 
 ## Итог и ограничения
 
-Вся доступная локальная проверка прошла. Итоговый diff остаётся незакоммиченным на локальном `main`; HEAD и `origin/main` остаются `4b7005b08745e47d5c02a7f8985f5598e0879fb3`. GitHub CI/release matrix для изменений, native Linux runtime diff и release readiness не подтверждены. Не создавать commit/tag/release самостоятельно.
+Кодовый commit `033024aa3050c1b196bcce98b15b93be272ddf3f` опубликован в ветке `chore/final-release-gate`, PR #6 открыт. Обычный PR CI и ручная release matrix 4/4 прошли; native Linux PTY runtime diff проверен в GitHub. PR ещё не влит в `main`; version tag и GitHub Release не создавались. После отдельного документационного follow-up результаты этого gate относятся к тому же runtime diff.
 
-Clipboard integration tests не запускались (они заменяют системный clipboard); destructive cuetty stress не запускался (он перегенерирует существующие artifacts). Pi/tmux rendering bug не диагностировался без reproduction steps и artifacts.
+Clipboard integration tests не запускались (они заменяют системный clipboard); destructive cuTTY stress не запускался (он перегенерирует существующие artifacts). Pi/tmux rendering bug не диагностировался без reproduction steps и artifacts.

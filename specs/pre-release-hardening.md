@@ -22,11 +22,11 @@
 ## Известные ограничения и открытые проверки
 
 - Реализуется поднабор ANSI/VT, а не полный xterm; `TERM=ansi` не означает поддержку всех ANSI controls. В частности, `mc4/mc5` и G2/G3 designators не обещаются.
-- Native Linux PTY/EIO и GitHub CI для итогового diff подтверждаются только после публикации разрешённого изменения; cross-compilation не заменяет Linux runtime tests.
-- Ручная release verification matrix (Linux/macOS, amd64/arm64) на итоговом commit требует ручного workflow dispatch; тег и GitHub Release не создаются этой задачей.
+- На момент проверки baseline native Linux PTY/EIO и GitHub CI для последующего release-gate diff ещё не были подтверждены; позднее Linux PTY runtime и ordinary GitHub CI для release-gate commit прошли.
+- На момент этой baseline записи release matrix для будущего diff не запускалась; позже ручной workflow_dispatch прошёл для Linux/macOS amd64/arm64 4/4. Подробности и run links приведены в [`final-release-gate.md`](final-release-gate.md).
 - Pi/tmux rendering issue не диагностируется без воспроизводимых шагов и соответствующих artifacts.
 - GitHub description обновлён и больше не заявляет OSC 52. `main` защищён PR, up-to-date обязательными checks `test (ubuntu-latest)`, `test (macos-latest)`, `static-analysis`, `pty-integration`, `vulnerability-scan`; force-push/deletion запрещены, signed commits не требуются. Настройки подтверждены read-back.
 
 ## Вывод
 
-Успешный CI на baseline `4b7005b` подтверждает только состояние опубликованного commit. Локальная проверка итоговой рабочей копии выполнена; детали и результаты перечислены в [`final-release-gate.md`](final-release-gate.md). GitHub CI и ручная release matrix ещё не проверяли итоговый diff, поскольку он остался локальным и не опубликован. Native Linux runtime на diff не подтверждён. Не создавать commit/tag/release самостоятельно и не объявлять release readiness до разрешённой интеграции и её GitHub checks.
+Успешный CI на baseline `4b7005b` подтверждает только состояние того опубликованного commit. Позже code commit `033024aa3050c1b196bcce98b15b93be272ddf3f` был опубликован в PR #6; ordinary GitHub CI, native Linux PTY runtime и ручная release matrix 4/4 прошли. Актуальные ссылки и результаты приведены в [`final-release-gate.md`](final-release-gate.md). PR остаётся открытым, version tag и GitHub Release не создавались.
