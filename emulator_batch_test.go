@@ -6,6 +6,7 @@ import (
 	"os"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -804,6 +805,133 @@ func TestOnExitCallbackReceivesProcessStatusOutsideLock(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("clipboard directory remains after child exit: %v", err)
+	}
+}
+
+func waitForEmulatorExit(t *testing.T, em *Emulator) PtyExitMsg {
+	t.Helper()
+	cmd := em.Listen()
+	for cmd != nil {
+		result := make(chan tea.Msg, 1)
+		go func(next tea.Cmd) { result <- next() }(cmd)
+		select {
+		case msg := <-result:
+			if exit, ok := msg.(PtyExitMsg); ok {
+				em.Update(exit)
+				return exit
+			}
+			cmd = em.Update(msg)
+		case <-time.After(10 * time.Second):
+			_ = em.Close()
+			<-result
+			t.Fatal("timed out waiting for child exit")
+		}
+	}
+	t.Fatal("Emulator.Listen returned no command for running child")
+	return PtyExitMsg{}
+}
+
+func startExitTestEmulator(t *testing.T, command string, args ...string) *Emulator {
+	t.Helper()
+	em := NewEmulator("session", "Session", command, args)
+	if err := em.StartSync(nil); err != nil {
+		t.Fatalf("start child: %v", err)
+	}
+	t.Cleanup(func() { _ = em.Close() })
+	return em
+}
+
+func TestOnExitNaturalExitExactlyOnce(t *testing.T) {
+	em := startExitTestEmulator(t, "/bin/sh", "-c", "exit 0")
+	var calls atomic.Int32
+	em.SetOnExit(func(PtyExitMsg) { calls.Add(1) })
+	exit := waitForEmulatorExit(t, em)
+	if !exit.ProcessExited || exit.ExitCode != 0 || exit.Signal != nil {
+		t.Fatalf("natural exit status = %+v, want code 0", exit)
+	}
+	em.Update(exit)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("natural OnExit calls = %d, want exactly once", got)
+	}
+}
+
+func TestOnExitNonZeroExitExactlyOnce(t *testing.T) {
+	em := startExitTestEmulator(t, "/bin/sh", "-c", "exit 23")
+	var calls atomic.Int32
+	em.SetOnExit(func(PtyExitMsg) { calls.Add(1) })
+	exit := waitForEmulatorExit(t, em)
+	if !exit.ProcessExited || exit.ExitCode != 23 || exit.Signal != nil {
+		t.Fatalf("non-zero exit status = %+v, want code 23", exit)
+	}
+	em.Update(exit)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("non-zero OnExit calls = %d, want exactly once", got)
+	}
+}
+
+func TestOnExitSignalExitExactlyOnce(t *testing.T) {
+	em := startExitTestEmulator(t, "/bin/sleep", "30")
+	var calls atomic.Int32
+	em.SetOnExit(func(PtyExitMsg) { calls.Add(1) })
+	state := em.PtyState()
+	process, err := os.FindProcess(state.PID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := process.Signal(syscall.SIGTERM); err != nil {
+		t.Fatalf("signal child: %v", err)
+	}
+	exit := waitForEmulatorExit(t, em)
+	if !exit.ProcessExited || exit.Signal != syscall.SIGTERM {
+		t.Fatalf("signal exit status = %+v, want SIGTERM", exit)
+	}
+	em.Update(exit)
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("signal OnExit calls = %d, want exactly once", got)
+	}
+}
+
+func TestOnExitStopSemantics(t *testing.T) {
+	em := startExitTestEmulator(t, "/bin/sleep", "30")
+	var calls atomic.Int32
+	em.SetOnExit(func(PtyExitMsg) { calls.Add(1) })
+	staleListen := em.Listen()
+	if staleListen == nil {
+		t.Fatal("Listen returned nil for running child")
+	}
+	if err := em.Stop(); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	msg := staleListen()
+	exit, ok := msg.(PtyExitMsg)
+	if !ok {
+		t.Fatalf("stale listener message = %T, want PtyExitMsg", msg)
+	}
+	em.Update(exit)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("Stop invoked OnExit %d times, want none", got)
+	}
+}
+
+func TestOnExitCloseSemantics(t *testing.T) {
+	em := startExitTestEmulator(t, "/bin/sleep", "30")
+	var calls atomic.Int32
+	em.SetOnExit(func(PtyExitMsg) { calls.Add(1) })
+	staleListen := em.Listen()
+	if staleListen == nil {
+		t.Fatal("Listen returned nil for running child")
+	}
+	if err := em.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	msg := staleListen()
+	exit, ok := msg.(PtyExitMsg)
+	if !ok {
+		t.Fatalf("stale listener message = %T, want PtyExitMsg", msg)
+	}
+	em.Update(exit)
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("Close invoked OnExit %d times, want none", got)
 	}
 }
 
