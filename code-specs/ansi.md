@@ -319,7 +319,9 @@ func (p *Parser) clearFromCursor()
 | `1003` | mouse all-motion tracking |
 | `1004` | focus reporting |
 | `1006` | SGR mouse encoding |
-| `1049` | альтернативный буфер экрана |
+| `1047` | альтернативный буфер без явного DECSC save slot |
+| `1048` | сохранить/восстановить DECSC cursor/parser state |
+| `1049` | альтернативный буфер с независимым cursor/parser save state |
 | `2004` | bracketed paste |
 | `2026` | синхронизированный вывод |
 
@@ -400,7 +402,7 @@ OSC 7 ;/absolute/path BEL
 
 ### OSC 0/2 — заголовок
 
-`OSC 0;title` и `OSC 2;title`, завершённые BEL или ST, вызывают `SetTitleCallback` при изменении валидированного заголовка. Пустые, превышающие 4096 байт или содержащие управляющие символы заголовки игнорируются.
+`OSC 0;title` и `OSC 2;title`, завершённые BEL или ST, вызывают `SetTitleCallback` при изменении валидированного заголовка. Пустое значение очищает текущий title и передаётся callback при переходе с непустого title; одинаковые повторы не дублируют событие. Значения свыше 4096 байт и строки с управляющими символами игнорируются.
 
 ---
 
@@ -514,8 +516,8 @@ Parser принимает callback ответов через \`SetResponseCallba
 - ED2 очищает экран без перемещения курсора.
 - ED1 и ED3 поддерживаются; ED3 очищает scrollback.
 - DECSC/DECRC сохраняют позицию, SGR, origin/autowrap modes и активные G0/G1 charsets.
-- `?1047` переключает alternate buffer, `?1048` сохраняет/восстанавливает cursor, `?1049` сочетает alternate buffer и cursor save; G0/G1 charset восстанавливается при выходе.
-- `CSI 4 h/l` переключает insert mode; `ESC c` выполняет RIS, `CSI ! p` — DECSTR без очистки основного текста.
+- `?1047` переключает alternate buffer без использования DECSC/DECRC save slot; `?1048` сохраняет/восстанавливает cursor и связанные G0/G1 charset modes; `?1049` добавляет независимое сохранение cursor/parser state и входит в очищенный alternate buffer.
+- `CSI 4 h/l` переключает insert mode; `ESC c` выполняет полный RIS, `CSI ! p` — DECSTR: сохраняет текст, текущую позицию и tab stops, но сбрасывает поддерживаемые modes/rendition и DECSC save state.
 - DA1 отвечает `CSI ? 1;2 c`; DA2 отвечает нейтральным `CSI > 0;0;0 c`, не заявляя конкретную версию xterm.
 - CUP/HVP/VPA учитывают DECOM и активный scroll region.
 - BCE применяется к ячейкам, создаваемым erase/insert/delete/scroll.

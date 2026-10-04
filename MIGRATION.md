@@ -20,7 +20,8 @@ cells := screen.CellsSnapshot() // глубокая копия, изменени
 - `Pty.Output`, `Pty.Errors` и `Pty.WriteForGeneration` больше не являются публичным API. `WriteForGeneration` был служебным lifecycle token, а прямое чтение каналов обходило упорядоченную доставку.
 - `Emulator.Pty()` удалён: сырой PTY раскрывал process/I/O handles. Для диагностики используйте snapshot `Emulator.PtyState()` (`Running`, `PID`, `Rows`, `Cols`).
 - Идентификаторы теперь читаются через `SessionID()` и `ChatName()`.
-- Callback-поля заменены setter-ами: `SetOnCWDChange`, `SetOnTitleChange`, `SetOnCommandHistoryChanged`, `SetOnError`, `SetOnExit`.
+- Callback-поля заменены setter-ами: `SetOnCWDChange`, `SetOnTitleChange`, `SetOnCommandHistoryChanged`, `SetOnError`, `SetOnExit`. Пустой OSC 0/2 очищает title и передаётся `SetOnTitleChange` при изменении.
+- `SetOnExit` вызывается ровно один раз только для принятого `Update` события фактического завершения child (`ProcessExited=true`). Host должен продолжать цепочку `Listen()` и направлять сообщения в `Update()`. Намеренные `Stop()` и `Close()` подавляют callback, включая их stale exit messages.
 - `PtyReadyMsg` содержит `Generation` и `ResizeErr`; `PtyExitMsg` расширен полями статуса процесса. Используйте именованные поля при создании литералов, поскольку внешние позиционные литералы ломаются при изменении состава полей.
 - При ошибке `TIOCSWINSZ` PTY остаётся живым, а Screen сохраняет последний успешно применённый размер; `OnError` получает ошибку, начальная ошибка дополнительно доступна в `PtyReadyMsg.ResizeErr`.
 

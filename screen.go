@@ -511,7 +511,8 @@ func (s *Screen) SoftReset() {
 		s.ExitAltScreen()
 	}
 	s.markDirty()
-	s.cursor = Cursor{}
+	cursor := s.cursor
+	s.cursor = clampCursorToSize(Cursor{Row: cursor.Row, Col: cursor.Col}, s.rows, s.cols)
 	s.cursorVisible = true
 	s.cursorBlinkVisible = true
 	s.originMode = false
@@ -527,14 +528,44 @@ func (s *Screen) SoftReset() {
 	s.focusReporting = false
 	s.scrollTop = 0
 	s.scrollBottom = s.rows - 1
-	s.tabStops = defaultTabStops(s.cols)
 	s.savedCursor = Cursor{}
 	s.savedOriginMode = false
 	s.savedAutoWrap = true
 	s.savedWrapPending = false
 	s.savedCells = nil
+	s.altSavedCursor = Cursor{}
+	s.altSavedScrollTop = 0
+	s.altSavedScrollBottom = s.rows - 1
+	s.altSavedOriginMode = false
+	s.altSavedAutoWrap = true
+	s.altSavedWrapPending = false
+	s.altScreen = false
 	s.selectionActive = false
 	s.SetSync(false)
+}
+
+type screenCursorState struct {
+	cursor      Cursor
+	originMode  bool
+	autoWrap    bool
+	wrapPending bool
+}
+
+func (s *Screen) cursorState() screenCursorState {
+	return screenCursorState{
+		cursor:      s.cursor,
+		originMode:  s.originMode,
+		autoWrap:    s.autoWrap,
+		wrapPending: s.wrapPending,
+	}
+}
+
+func (s *Screen) restoreCursorState(state screenCursorState) {
+	s.markDirty()
+	s.cursor = clampCursorToSize(state.cursor, s.rows, s.cols)
+	s.originMode = state.originMode
+	s.autoWrap = state.autoWrap
+	s.wrapPending = state.wrapPending
 }
 
 // SetScrollbackLimit sets the maximum number of retained lines. A value of
